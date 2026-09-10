@@ -1,0 +1,118 @@
+#!/bin/sh
+# pcmlink-ctl - start, stop, restart and inspect the audio link.
+#
+# A convenience wrapper for the common two-machine setup: a receiver on this
+# machine and a sender running as a scheduled task on a Windows host reachable
+# over ssh. Written for macOS receivers; adjust the log path elsewhere.
+#
+#   receiver (this Mac)   pcmlink.py receive  ->  Focusrite
+#   sender   (Windows VM) scheduled task "pcmlink-send"
+#
+# The receiver is deliberately started from your shell rather than by launchd:
+# a launchd-spawned process is invisible to SoundSource, so its volume control
+# would stop working. Keep it that way.
+
+set -eu
+
+DIR="${PCMLINK_DIR:-$HOME/projects/pcmlink}"
+DEVICE="${PCMLINK_CTL_DEVICE:-Scarlett}"
+VOLUME="${PCMLINK_CTL_VOLUME:-1.0}"
+WIN="${PCMLINK_CTL_WIN_HOST:-win11}"
+LOG="${PCMLINK_CTL_LOG:-$HOME/Library/Logs/pcmlink/receive.log}"
+PY="${PCMLINK_CTL_PYTHON:-python3}"
+TASK=pcmlink-send
+
+c_ok=$(printf '\033[32m'); c_bad=$(printf '\033[31m'); c_dim=$(printf '\033[2m'); c_off=$(printf '\033[0m')
+
+rx_pid() { pgrep -f "pcmlink.py receive" 2>/dev/null | head -1; }
+
+rx_start() {
+    if [ -n "$(rx_pid)" ]; then echo "receiver already running (pid $(rx_pid))"; return 0; fi
+    mkdir -p "$(dirname "$LOG")"
+    # Detach completely: stdin from /dev/null and both outputs to the log, so
+    # the child holds none of this script's file descriptors open. Without that
+    # a caller waiting on our output blocks until the receiver itself exits.
+    ( cd "$DIR" && nohup "$PY" pcmlink.py receive --device "$DEVICE" --volume "$VOLUME" \
+        </dev/null >>"$LOG" 2>&1 & ) >/dev/null 2>&1
+    sleep 2
+    if [ -n "$(rx_pid)" ]; then echo "receiver started (pid $(rx_pid))"
+    else echo "${c_bad}receiver failed to start${c_off}; see $LOG"; return 1; fi
+}
+
+rx_stop() {
+    pid=$(rx_pid) || true
+    if [ -z "${pid:-}" ]; then echo "receiver not running"; return 0; fi
+    pkill -f "pcmlink.py receive" 2>/dev/null || true
+    sleep 1
+    echo "receiver stopped (was pid $pid)"
+}
+
+tx_start() { ssh -o ConnectTimeout=8 "$WIN" "schtasks /run /tn $TASK" >/dev/null 2>&1 \
+    && echo "sender started" || echo "${c_bad}could not start sender${c_off}"; }
+
+tx_stop() { ssh -o ConnectTimeout=8 "$WIN" "schtasks /end /tn $TASK" >/dev/null 2>&1 \
+    && echo "sender stopped" || echo "${c_bad}could not stop sender${c_off}"; }
+
+flow() {
+    # Two samples a second apart: if the packet counter moves, audio is flowing.
+    a=$(tail -1 "$LOG" 2>/dev/null)
+    sleep 2
+    b=$(tail -1 "$LOG" 2>/dev/null)
+    [ -n "$a" ] && [ "$a" != "$b" ] || return 1
+    # The line advances every second while running; require a non-zero rate too,
+    # so "receiver alive but sender silent" is not reported as flowing.
+    echo "$b" | grep -qE 'pkt/s= *[1-9]' || return 1
+}
+
+status() {
+    printf 'receiver  '
+    pid=$(rx_pid) || true
+    if [ -n "${pid:-}" ]; then printf '%srunning%s  pid %s\n' "$c_ok" "$c_off" "$pid"
+    else printf '%sstopped%s\n' "$c_bad" "$c_off"; fi
+
+    printf 'sender    '
+    st=$(ssh -o ConnectTimeout=8 "$WIN" "schtasks /query /tn $TASK /fo list" 2>/dev/null \
+         | tr -d '\r' | awk -F: '/Status/{gsub(/^ +/,"",$2); print $2}')
+    case "${st:-}" in
+        Running) printf '%srunning%s\n' "$c_ok" "$c_off" ;;
+        "")      printf '%sunreachable%s (%s)\n' "$c_bad" "$c_off" "$WIN" ;;
+        *)       printf '%s%s%s\n' "$c_bad" "$st" "$c_off" ;;
+    esac
+
+    printf 'audio     '
+    if [ -n "${pid:-}" ] && flow; then printf '%sflowing%s\n' "$c_ok" "$c_off"
+    else printf '%sno packets%s\n' "$c_bad" "$c_off"; fi
+
+    printf '%s%s%s\n' "$c_dim" "$(tail -1 "$LOG" 2>/dev/null)" "$c_off"
+}
+
+case "${1:-status}" in
+    status)   status ;;
+    start)    rx_start; tx_start ;;
+    stop)     tx_stop; rx_stop ;;
+    restart)  tx_stop; rx_stop; sleep 1; rx_start; tx_start; sleep 3; echo; status ;;
+    restart-rx|rx) rx_stop; sleep 1; rx_start ;;
+    restart-tx|tx) tx_stop; sleep 1; tx_start ;;
+    logs)     tail -f "$LOG" ;;
+    sender-logs) ssh "$WIN" 'powershell -NoProfile -c "Get-Content \"$env:LOCALAPPDATA\pcmlink\send.log\" -Tail 30 -Wait"' ;;
+    *) cat <<USAGE
+usage: pcmlink-ctl [command]
+
+  status        both ends, and whether packets are actually moving (default)
+  start|stop    both ends
+  restart       both ends, then show status
+  restart-rx    receiver only (this Mac)
+  restart-tx    sender only (Windows VM)
+  logs          follow the receiver log
+  sender-logs   follow the sender log over ssh
+
+environment:
+  PCMLINK_CTL_DEVICE     output device substring          (default: Scarlett)
+  PCMLINK_CTL_VOLUME     software gain                    (default: 1.0)
+  PCMLINK_CTL_WIN_HOST   ssh host alias of the sender     (default: win11)
+  PCMLINK_CTL_LOG        receiver log path
+  PCMLINK_CTL_PYTHON     interpreter to run the receiver  (default: python3)
+  PCMLINK_DIR            checkout containing pcmlink.py
+USAGE
+       exit 1 ;;
+esac

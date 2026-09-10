@@ -106,6 +106,23 @@ Logs go to `~/Library/Logs/pcmlink/` on macOS, the journal on Linux
 Windows. Task Scheduler captures no output of its own, so the program writes
 its own log there via `--log`.
 
+### Controlling both ends at once
+
+`contrib/pcmlink-ctl` is a small shell wrapper for the common two-machine case:
+a receiver here, a sender running as a scheduled task on a Windows host
+reachable over ssh.
+
+```sh
+pcmlink-ctl status      # both ends, and whether packets are actually moving
+pcmlink-ctl restart     # restart both, then report
+pcmlink-ctl restart-tx  # sender only
+pcmlink-ctl logs        # follow the receiver log
+```
+
+`status` samples the log twice and requires a non-zero packet rate, so a
+receiver that is running while the sender is silent reports as **no packets**
+rather than a false green.
+
 ## Volume
 
 `--volume` applies a software gain: `1.0` is unity, `0.5` is roughly −6 dB,
