@@ -84,13 +84,22 @@ command line works as a service.
 
 | Platform | Mechanism | Restart behaviour |
 |---|---|---|
-| macOS | launchd agent in `~/Library/LaunchAgents` | `KeepAlive`, effectively immediate |
+| macOS | hidden login item (`~/Applications/pcmlink.app`) | in-process, `retry_delay` seconds |
 | Linux | systemd `--user` unit | `Restart=always`, `RestartSec=5` |
 | Windows | Task Scheduler, at logon, hidden | 3 retries at 1-minute intervals |
 
 Windows restarts are noticeably slower than the other two: Task Scheduler's
 minimum retry interval is one minute, so a crash there costs a minute of
 silence rather than seconds.
+
+**macOS deliberately does not use a launchd agent.** A process started by
+launchd is not visible to per-application audio tools — SoundSource could not
+see it or apply its software volume, which matters because many interfaces
+expose no volume to macOS at all and such a tool is the only control available.
+A process launched by LaunchServices from the GUI session is visible, so the
+macOS service is a windowless login item whose bundle owns both its interpreter
+and its script. For the same reason the receiver restarts its own pipeline
+in-process (`retry`) rather than exiting to be respawned by a supervisor.
 
 Logs go to `~/Library/Logs/pcmlink/` on macOS, the journal on Linux
 (`journalctl --user -u pcmlink-receive -f`), and `%LOCALAPPDATA%\pcmlink\` on

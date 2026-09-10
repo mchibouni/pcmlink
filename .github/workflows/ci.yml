@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    # The logic tests deliberately need no audio stack, so they run everywhere
+    # the tool claims to run, including Windows.
+    name: unit (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Byte-compile
+        run: python -m compileall -q pcmlink.py tests
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check .
+
+  smoke:
+    # Exercises the real GStreamer paths: element discovery, preflight and
+    # pipeline construction, without opening an audio device.
+    name: smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio
+
+      - name: Install GStreamer (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gstreamer pygobject3
+
+      - name: Version and help
+        run: python3 pcmlink.py --help
+
+      - name: Effective configuration
+        run: python3 pcmlink.py config --role receive
+
+      - name: Device enumeration must not crash without audio hardware
+        run: |
+          python3 pcmlink.py devices
+          python3 pcmlink.py devices --kind Source
+
+      - name: Sender pipeline builds (test tone, no capture device needed)
+        run: python3 pcmlink.py send --host 127.0.0.1 --test-tone --dry-run
+
+      - name: Receiver pipeline builds and preflight passes
+        run: python3 pcmlink.py receive --dry-run
+
+      - name: Preflight rejects a missing destination
+        run: |
+          if python3 pcmlink.py send --dry-run; then
+            echo "expected preflight to fail without --host" >&2
+            exit 1
+          fi
+
+      - name: Preflight rejects an unknown device
+        run: |
+          if python3 pcmlink.py receive --device NoSuchDevice --dry-run; then
+            echo "expected preflight to fail for an unknown device" >&2
+            exit 1
+          fi

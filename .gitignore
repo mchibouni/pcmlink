@@ -5,3 +5,4 @@ venv/
 *.log
 pcmlink.toml
 .DS_Store
+macos/

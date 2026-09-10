@@ -45,6 +45,8 @@ SETTINGS: dict[str, tuple[object, str]] = {
     "tone_freq":    (440,      "test tone frequency in Hz"),
     "tone_volume":  (0.05,     "test tone volume, 0.0 to 1.0"),
     "gst_launch":   ("",       "path to gst-launch-1.0 (blank = search PATH)"),
+    "retry":        (True,     "rebuild and restart the pipeline after a failure"),
+    "retry_delay":  (5,        "seconds to wait before retrying"),
 }
 DEFAULTS = {k: v for k, (v, _) in SETTINGS.items()}
 
@@ -311,9 +313,8 @@ def preflight(role: str, cfg: dict, tone: bool) -> list[str]:
     problems: list[str] = []
     Gst, _ = gst(required=(role == "receive"))
 
-    if role == "send" and Gst is None:
-        if not find_gst_launch(cfg):
-            problems.append(
+    if role == "send" and Gst is None and not find_gst_launch(cfg):
+        problems.append(
                 "neither GStreamer Python bindings nor gst-launch-1.0 found "
                 "(set gst_launch in config, or PCMLINK_GST_LAUNCH)")
     if Gst is not None:
@@ -379,9 +380,30 @@ def run_subprocess(desc: str, cfg: dict) -> int:
 
 
 def run(desc: str, cfg: dict, role: str) -> int:
+    """Run the pipeline, restarting it in-process if it fails.
+
+    Retrying here rather than relying on an external supervisor keeps the
+    process in the session that started it. On macOS that matters: a process
+    launched by launchd is not visible to per-application volume tools such as
+    SoundSource, while one launched from the GUI session is, so respawning
+    must not mean being respawned by a daemon.
+    """
     Gst, GLib = gst(required=(role == "receive"))
     if Gst is None:
         return run_subprocess(desc, cfg)
+    while True:
+        code = _run_once(desc, cfg, role, Gst, GLib)
+        if code == 0 or not cfg["retry"]:
+            return code
+        delay = max(1, int(cfg["retry_delay"]))
+        print(f"{APP}: pipeline failed, retrying in {delay}s", flush=True)
+        try:
+            time.sleep(delay)
+        except KeyboardInterrupt:
+            return 0
+
+
+def _run_once(desc: str, cfg: dict, role: str, Gst, GLib) -> int:
     try:
         pipeline = Gst.parse_launch(desc)
     except GLib.Error as exc:
@@ -469,9 +491,9 @@ def _invocation() -> list[str]:
     program. Only accept a genuine console executable.
     """
     console = shutil.which(APP)
-    if console and os.path.abspath(console) != os.path.abspath(__file__):
-        if platform.system() != "Windows" or console.lower().endswith(".exe"):
-            return [console]
+    if (console and os.path.abspath(console) != os.path.abspath(__file__)
+            and (platform.system() != "Windows" or console.lower().endswith(".exe"))):
+        return [console]
     exe = sys.executable
     if platform.system() == "Windows":
         noconsole = os.path.join(os.path.dirname(exe), "pythonw.exe")
@@ -509,6 +531,9 @@ def service_install(role: str, extra: list[str], start: bool) -> int:
     log = _log_path(role)
 
     if system == "Darwin":
+        return _install_login_item(role, extra, start)
+
+    if system == "__disabled_launchd__":
         path = _plist_path(role)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         args = "".join(f"    <string>{escape(a)}</string>\n" for a in argv)
@@ -523,14 +548,25 @@ def service_install(role: str, extra: list[str], start: bool) -> int:
                 '  <key>RunAtLoad</key><true/>\n'
                 '  <key>KeepAlive</key><true/>\n'
                 '  <key>ProcessType</key><string>Interactive</string>\n'
+                # Pin the agent to the Aqua (GUI login) session. Without this,
+                # per-application audio tools such as SoundSource do not see the
+                # process and cannot apply their software volume to it.
+                '  <key>LimitLoadToSessionType</key><string>Aqua</string>\n'
                 f'  <key>StandardOutPath</key><string>{escape(log)}</string>\n'
                 f'  <key>StandardErrorPath</key><string>{escape(log)}</string>\n'
                 '</dict></plist>\n')
         domain = f"gui/{os.getuid()}"
         subprocess.run(["launchctl", "bootout", f"{domain}/{SERVICE_LABEL}.{role}"],
                        capture_output=True)
-        r = subprocess.run(["launchctl", "bootstrap", domain, path], capture_output=True, text=True)
-        if r.returncode != 0:
+        # bootout is asynchronous: bootstrapping immediately afterwards can hit a
+        # service that is still unloading, so retry briefly before giving up.
+        for _ in range(10):
+            r = subprocess.run(["launchctl", "bootstrap", domain, path],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                break
+            time.sleep(0.5)
+        else:
             die(f"launchctl bootstrap failed: {r.stderr.strip() or r.returncode}")
         if start:
             subprocess.run(["launchctl", "kickstart", f"{domain}/{SERVICE_LABEL}.{role}"],
@@ -591,6 +627,76 @@ def service_install(role: str, extra: list[str], start: bool) -> int:
         print(f"registered scheduled task {name} (at logon, hidden, restarts on failure)")
         return 0
     die(f"service management is not implemented for {system}")
+
+
+def _app_bundle_path() -> str:
+    return os.path.join(os.path.expanduser("~/Applications"), f"{APP}.app")
+
+
+def _build_app_bundle(role: str, extra: list[str]) -> str:
+    """Create a windowless .app that owns both its interpreter and its script.
+
+    LaunchServices starts this in the GUI login session, which is what keeps the
+    process visible to per-application audio tools such as SoundSource; a
+    launchd agent is not. The bundle executable is a launcher that execs the
+    interpreter copied *inside* the bundle, so after exec the running image is
+    still a bundle path rather than a system-wide interpreter.
+    """
+    app = _app_bundle_path()
+    macos_dir = os.path.join(app, "Contents", "MacOS")
+    res_dir = os.path.join(app, "Contents", "Resources")
+    os.makedirs(macos_dir, exist_ok=True)
+    os.makedirs(res_dir, exist_ok=True)
+
+    interpreter = os.path.join(macos_dir, f"{APP}-python")
+    shutil.copy2(os.path.realpath(sys.executable), interpreter)
+    os.chmod(interpreter, 0o755)
+    script = os.path.join(res_dir, f"{APP}.py")
+    shutil.copy2(os.path.abspath(__file__), script)
+
+    quoted = " ".join(shlex.quote(a) for a in [role] + extra)
+    launcher = os.path.join(macos_dir, APP)
+    with open(launcher, "w") as fh:
+        fh.write(
+            "#!/bin/sh\n"
+            'dir=$(cd "$(dirname "$0")" && pwd)\n'
+            f'exec "$dir/{APP}-python" "$dir/../Resources/{APP}.py" {quoted}\n')
+    os.chmod(launcher, 0o755)
+
+    with open(os.path.join(app, "Contents", "Info.plist"), "w") as fh:
+        fh.write(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0"><dict>\n'
+            f'  <key>CFBundleName</key><string>{APP}</string>\n'
+            f'  <key>CFBundleIdentifier</key><string>{SERVICE_LABEL}.{role}</string>\n'
+            f'  <key>CFBundleExecutable</key><string>{APP}</string>\n'
+            '  <key>CFBundlePackageType</key><string>APPL</string>\n'
+            '  <key>CFBundleVersion</key><string>0.1.0</string>\n'
+            '  <key>LSUIElement</key><true/>\n'
+            '</dict></plist>\n')
+    return app
+
+
+def _install_login_item(role: str, extra: list[str], start: bool) -> int:
+    app = _build_app_bundle(role, extra)
+    subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+                    "LaunchServices.framework/Support/lsregister", "-f", app],
+                   capture_output=True)
+    script = (f'tell application "System Events" to delete '
+              f'(every login item whose name is "{APP}")')
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+    script = (f'tell application "System Events" to make login item at end '
+              f'with properties {{path:"{app}", hidden:true}}')
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"could not add login item: {r.stderr.strip()}")
+    if start:
+        subprocess.run(["open", "-a", app], capture_output=True)
+    print(f"installed {app} as a hidden login item\n"
+          f"logs: {_log_path(role)}")
+    return 0
 
 
 def service_uninstall(role: str) -> int:
@@ -698,7 +804,8 @@ def main(argv=None) -> int:
 
     if getattr(a, "log", None):
         os.makedirs(os.path.dirname(os.path.abspath(a.log)) or ".", exist_ok=True)
-        fh = open(a.log, "a", buffering=1)
+        # Held open for the lifetime of the process on purpose.
+        fh = open(a.log, "a", buffering=1)  # noqa: SIM115
         sys.stdout = fh
         sys.stderr = fh
 
