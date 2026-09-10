@@ -25,6 +25,7 @@ TASK=pcmlink-send
 c_ok=$(printf '\033[32m'); c_bad=$(printf '\033[31m'); c_dim=$(printf '\033[2m'); c_off=$(printf '\033[0m')
 
 rx_pid() { pgrep -f "pcmlink.py receive" 2>/dev/null | head -1; }
+rx_count() { pgrep -f "pcmlink.py receive" 2>/dev/null | wc -l | tr -d ' '; }
 
 rx_start() {
     if [ -n "$(rx_pid)" ]; then echo "receiver already running (pid $(rx_pid))"; return 0; fi
@@ -47,11 +48,39 @@ rx_stop() {
     echo "receiver stopped (was pid $pid)"
 }
 
-tx_start() { ssh -o ConnectTimeout=8 "$WIN" "schtasks /run /tn $TASK" >/dev/null 2>&1 \
-    && echo "sender started" || echo "${c_bad}could not start sender${c_off}"; }
+# Number of sender pipelines on the remote host. More than one means several
+# RTP streams are arriving on the same port with independent sequence numbers,
+# which the receiver scores as enormous packet loss. Ending the scheduled task
+# does not kill processes it already started, so orphans accumulate silently.
+tx_count() {
+    ssh -o ConnectTimeout=8 "$WIN" \
+        'powershell -NoProfile -Command "(@(Get-Process gst-launch-1.0 -ErrorAction SilentlyContinue)).Count"' \
+        2>/dev/null | tr -d '\r' | tail -1
+}
 
-tx_stop() { ssh -o ConnectTimeout=8 "$WIN" "schtasks /end /tn $TASK" >/dev/null 2>&1 \
-    && echo "sender stopped" || echo "${c_bad}could not stop sender${c_off}"; }
+tx_start() {
+    ssh -o ConnectTimeout=8 "$WIN" "schtasks /run /tn $TASK" >/dev/null 2>&1 || {
+        echo "${c_bad}could not start sender${c_off}"; return 1; }
+    sleep 6
+    n=$(tx_count)
+    case "${n:-0}" in
+        1) echo "sender started" ;;
+        0) echo "${c_bad}sender did not come up${c_off}" ; return 1 ;;
+        *) echo "${c_bad}warning: $n sender processes running${c_off}" ; return 1 ;;
+    esac
+}
+
+tx_stop() {
+    ssh -o ConnectTimeout=8 "$WIN" "schtasks /end /tn $TASK" >/dev/null 2>&1 || true
+    # Ending the task leaves its children behind; kill them explicitly.
+    ssh -o ConnectTimeout=8 "$WIN" \
+        'powershell -NoProfile -Command "Stop-Process -Name gst-launch-1.0,pythonw -Force -ErrorAction SilentlyContinue"' \
+        >/dev/null 2>&1 || true
+    sleep 2
+    n=$(tx_count)
+    if [ "${n:-0}" = "0" ]; then echo "sender stopped"
+    else echo "${c_bad}sender still has $n process(es)${c_off}"; fi
+}
 
 flow() {
     # Two samples a second apart: if the packet counter moves, audio is flowing.
@@ -70,18 +99,34 @@ status() {
     if [ -n "${pid:-}" ]; then printf '%srunning%s  pid %s\n' "$c_ok" "$c_off" "$pid"
     else printf '%sstopped%s\n' "$c_bad" "$c_off"; fi
 
+    if [ "$(rx_count)" -gt 1 ]; then
+        printf '          %swarning: %s receiver processes%s\n' "$c_bad" "$(rx_count)" "$c_off"
+    fi
+
     printf 'sender    '
-    st=$(ssh -o ConnectTimeout=8 "$WIN" "schtasks /query /tn $TASK /fo list" 2>/dev/null \
-         | tr -d '\r' | awk -F: '/Status/{gsub(/^ +/,"",$2); print $2}')
-    case "${st:-}" in
-        Running) printf '%srunning%s\n' "$c_ok" "$c_off" ;;
-        "")      printf '%sunreachable%s (%s)\n' "$c_bad" "$c_off" "$WIN" ;;
-        *)       printf '%s%s%s\n' "$c_bad" "$st" "$c_off" ;;
+    n=$(tx_count)
+    case "${n:-}" in
+        1)  printf '%srunning%s\n' "$c_ok" "$c_off" ;;
+        0)  printf '%sstopped%s\n' "$c_bad" "$c_off" ;;
+        "") printf '%sunreachable%s (%s)\n' "$c_bad" "$c_off" "$WIN" ;;
+        *)  printf '%s%s processes - duplicates cause false packet loss%s\n' \
+                "$c_bad" "$n" "$c_off" ;;
     esac
 
     printf 'audio     '
     if [ -n "${pid:-}" ] && flow; then printf '%sflowing%s\n' "$c_ok" "$c_off"
     else printf '%sno packets%s\n' "$c_bad" "$c_off"; fi
+
+    printf 'loss      '
+    la=$(tail -1 "$LOG" 2>/dev/null | grep -oE 'lost=[0-9]+' | cut -d= -f2)
+    sleep 2
+    lb=$(tail -1 "$LOG" 2>/dev/null | grep -oE 'lost=[0-9]+' | cut -d= -f2)
+    if [ -z "${la:-}" ]; then printf '%sunknown%s\n' "$c_dim" "$c_off"
+    elif [ "$la" = "$lb" ]; then
+        printf '%sstable%s (%s cumulative, not increasing)\n' "$c_ok" "$c_off" "$la"
+    else
+        printf '%sincreasing%s (+%s in 2s)\n' "$c_bad" "$c_off" "$((lb - la))"
+    fi
 
     printf '%s%s%s\n' "$c_dim" "$(tail -1 "$LOG" 2>/dev/null)" "$c_off"
 }
