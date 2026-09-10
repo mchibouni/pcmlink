@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcmlink"
+version = "0.1.0"
+description = "Uncompressed PCM audio over a LAN, sender and receiver"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["audio", "rtp", "lan", "gstreamer", "pcm"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Topic :: Multimedia :: Sound/Audio",
+]
+# No Python dependencies. GStreamer and, for the receiver, its GObject
+# introspection bindings are system packages; see the README.
+dependencies = []
+
+[project.scripts]
+pcmlink = "pcmlink:main"
+
+[tool.setuptools]
+py-modules = ["pcmlink"]

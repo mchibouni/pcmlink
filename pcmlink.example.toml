@@ -1,0 +1,29 @@
+# pcmlink configuration
+#
+# Copy to one of the paths shown by `pcmlink config`, most usefully:
+#   Linux/macOS   ~/.config/pcmlink/config.toml
+#   Windows       %APPDATA%\pcmlink\config.toml
+# or keep a per-project pcmlink.toml in the working directory.
+#
+# Precedence, least important first:
+#   defaults < system config < user config < ./pcmlink.toml < PCMLINK_* env < CLI flags
+# Keys at the top level apply to both roles; the [send] and [receive] tables
+# override them for that role only.
+
+port     = 5004
+rate     = 48000     # must match on both ends
+channels = 2
+
+[send]
+host = "192.168.1.50"   # the receiver
+mtu  = 1200             # 1200 gives ~5 ms packets at 48 kHz stereo
+# device = "Virtual Speakers"   # capture endpoint substring; blank = system default
+
+[receive]
+device  = "Scarlett"    # output device name substring, not a raw UID
+latency = 100           # jitterbuffer depth in ms; raise if you hear dropouts
+
+# Output device buffering. These are deliberately generous: tight values
+# starve the device and produce clicking.
+buffer_time  = 100000   # microseconds
+latency_time = 20000    # microseconds
