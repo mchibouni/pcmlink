@@ -67,6 +67,50 @@ failure that lists what is actually available.
 to tell a transport problem from a capture problem: if the tone is clean and
 real audio is not, the fault is on the capture side.
 
+## Running it in the background
+
+`pcmlink service` hands supervision to the platform's own service manager
+rather than reimplementing it. In every case the service starts at login, runs
+without a window, and is restarted if it exits.
+
+```sh
+pcmlink service install receive -- --device Scarlett --volume 0.6
+pcmlink service status receive
+pcmlink service uninstall receive
+```
+
+Arguments after `--` are passed to the role, so anything that works on the
+command line works as a service.
+
+| Platform | Mechanism | Restart behaviour |
+|---|---|---|
+| macOS | launchd agent in `~/Library/LaunchAgents` | `KeepAlive`, effectively immediate |
+| Linux | systemd `--user` unit | `Restart=always`, `RestartSec=5` |
+| Windows | Task Scheduler, at logon, hidden | 3 retries at 1-minute intervals |
+
+Windows restarts are noticeably slower than the other two: Task Scheduler's
+minimum retry interval is one minute, so a crash there costs a minute of
+silence rather than seconds.
+
+Logs go to `~/Library/Logs/pcmlink/` on macOS, the journal on Linux
+(`journalctl --user -u pcmlink-receive -f`), and `%LOCALAPPDATA%\pcmlink\` on
+Windows. Task Scheduler captures no output of its own, so the program writes
+its own log there via `--log`.
+
+## Volume
+
+`--volume` applies a software gain: `1.0` is unity, `0.5` is roughly −6 dB,
+`2.0` is +6 dB. It is available on both roles, applied after capture on the
+sender and before the output device on the receiver.
+
+This exists because the operating system's volume slider often does **not**
+affect what pcmlink sends. A WASAPI loopback tap is only attenuated when
+Windows inserts a volume APO into the software audio engine; on an endpoint
+with hardware volume support — and on most virtual sound cards — the tap is
+full-scale no matter where the slider sits. Many audio interfaces also have no
+software volume at all, only a physical knob. `--volume` is the reliable
+control.
+
 ## Statistics
 
 The receiver prints one line per second:
@@ -118,6 +162,13 @@ pipelines:
 - **Do not set `low-latency=true` on `wasapi2src`.** It starves capture and
   produces continuous clicking that looks exactly like packet loss in the
   statistics, while `lost` stays at zero.
+- **Big-endian audio is poorly supported by most elements**, which bites more
+  than once. `volume` cannot process `S16BE`, so on the sender the gain is
+  applied in native byte order and converted afterwards.
+- **`shutil.which()` is unsafe for locating an installed console script on
+  Windows**: `PATHEXT` includes `.PY` and the current directory is searched, so
+  it will cheerfully return the source file and a generated service will try to
+  execute the script as its own program.
 
 ## Limitations
 

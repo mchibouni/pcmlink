@@ -40,6 +40,7 @@ SETTINGS: dict[str, tuple[object, str]] = {
     "latency_time": (20000,    "output device period in microseconds"),
     "device":       ("",       "device name substring; empty means system default"),
     "format":       ("F32LE",  "sample format handed to the output device"),
+    "volume":       (1.0,      "software gain, 1.0 = unity, 0.5 = -6 dB, 2.0 = +6 dB"),
     "stats":        (True,     "print one statistics line per second"),
     "tone_freq":    (440,      "test tone frequency in Hz"),
     "tone_volume":  (0.05,     "test tone volume, 0.0 to 1.0"),
@@ -220,6 +221,10 @@ def build_send(cfg: dict, tone: bool) -> str:
     return (
         f"{head} "
         f"! audioconvert ! audioresample "
+        # Gain is applied in native byte order: the volume element cannot
+        # handle S16BE, so the wire-format conversion must come after it.
+        f"! volume name=gain volume={cfg['volume']} "
+        f"! audioconvert "
         f"! audio/x-raw,format=S16BE,rate={cfg['rate']},"
         f"channels={cfg['channels']},layout=interleaved "
         f"! rtpL16pay pt={cfg['payload']} mtu={cfg['mtu']} "
@@ -248,6 +253,10 @@ def build_receive(cfg: dict) -> str:
         # wire and play byte-swapped samples, which sounds like loud static.
         f"! audio/x-raw,format={cfg['format']},rate={cfg['rate']},"
         f"channels={cfg['channels']} "
+        # Software gain: an OS volume slider does not reliably attenuate a
+        # WASAPI loopback tap, and many interfaces have no software volume at
+        # all, so the level is controlled here.
+        f"! volume name=gain volume={cfg['volume']} "
         f"! {sink} name=sink{tail}"
     )
 
@@ -320,6 +329,8 @@ def preflight(role: str, cfg: dict, tone: bool) -> list[str]:
         if missing:
             problems.append(f"missing GStreamer elements: {', '.join(missing)}")
 
+    if not 0.0 <= float(cfg["volume"]) <= 8.0:
+        problems.append(f"volume {cfg['volume']} out of range (0.0 to 8.0)")
     if role == "send":
         if not cfg["host"]:
             problems.append(f"no destination host (--host, config, or {APP.upper()}_HOST)")
@@ -353,8 +364,16 @@ def run_subprocess(desc: str, cfg: dict) -> int:
         die("gst-launch-1.0 not found")
     argv = [exe] + shlex.split(desc, posix=(platform.system() != "Windows"))
     print(f"{APP}: using {exe} (no Python bindings; statistics unavailable)", flush=True)
+    # Inherit our own streams where they are real files. Under pythonw.exe there
+    # are no valid standard handles at all, and a child that inherits them fails
+    # immediately and silently, so fall back to discarding output.
     try:
-        return subprocess.call(argv)
+        sys.stdout.fileno()
+        out, err = sys.stdout, sys.stderr
+    except Exception:
+        out = err = subprocess.DEVNULL
+    try:
+        return subprocess.call(argv, stdout=out, stderr=err)
     except KeyboardInterrupt:
         return 0
 
@@ -369,7 +388,7 @@ def run(desc: str, cfg: dict, role: str) -> int:
         die(f"could not build pipeline: {exc.message}")
 
     jb = pipeline.get_by_name("jb")
-    st = {"t0": None, "p0": 0, "last": 0, "qos": 0, "warn": 0}
+    st = {"t0": None, "p0": 0, "last": 0, "qos": 0, "warn": 0, "failed": False}
     loop = GLib.MainLoop()
 
     def on_msg(_bus, msg):
@@ -380,6 +399,7 @@ def run(desc: str, cfg: dict, role: str) -> int:
             print(f"  !! WARNING {msg.parse_warning()[0].message}", flush=True)
         elif msg.type == Gst.MessageType.ERROR:
             print(f"  !! ERROR {msg.parse_error()[0].message}", flush=True)
+            st["failed"] = True
             loop.quit()
         elif msg.type == Gst.MessageType.EOS:
             loop.quit()
@@ -427,6 +447,196 @@ def run(desc: str, cfg: dict, role: str) -> int:
         print("\nstopping", flush=True)
     finally:
         pipeline.set_state(Gst.State.NULL)
+    # Non-zero on failure so launchd/systemd/Task Scheduler restart us.
+    return 1 if st["failed"] else 0
+
+
+# ---------------------------------------------------------------- service
+# Supervision is delegated to the platform's own service manager rather than
+# reimplemented: launchd on macOS, systemd --user on Linux, Task Scheduler on
+# Windows. Each is configured to start at login, run without a window, and
+# restart on failure.
+
+SERVICE_LABEL = "io.pcmlink"
+
+
+def _invocation() -> list[str]:
+    """How to re-invoke this program from a service definition.
+
+    shutil.which() must be treated carefully on Windows: PATHEXT includes .PY
+    and the current directory is searched, so it happily returns this very
+    script and the service ends up invoking the source file as its own
+    program. Only accept a genuine console executable.
+    """
+    console = shutil.which(APP)
+    if console and os.path.abspath(console) != os.path.abspath(__file__):
+        if platform.system() != "Windows" or console.lower().endswith(".exe"):
+            return [console]
+    exe = sys.executable
+    if platform.system() == "Windows":
+        noconsole = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.isfile(noconsole):
+            exe = noconsole  # no console window on logon
+    return [exe, os.path.abspath(__file__)]
+
+
+def _log_path(role: str) -> str:
+    system = platform.system()
+    if system == "Darwin":
+        base = os.path.expanduser(f"~/Library/Logs/{APP}")
+    elif system == "Windows":
+        base = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP)
+    else:
+        base = os.path.join(
+            os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), APP)
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, f"{role}.log")
+
+
+def _plist_path(role: str) -> str:
+    return os.path.expanduser(f"~/Library/LaunchAgents/{SERVICE_LABEL}.{role}.plist")
+
+
+def _unit_path(role: str) -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "systemd", "user", f"{APP}-{role}.service")
+
+
+def service_install(role: str, extra: list[str], start: bool) -> int:
+    from xml.sax.saxutils import escape
+    argv = _invocation() + [role] + extra
+    system = platform.system()
+    log = _log_path(role)
+
+    if system == "Darwin":
+        path = _plist_path(role)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        args = "".join(f"    <string>{escape(a)}</string>\n" for a in argv)
+        with open(path, "w") as fh:
+            fh.write(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                '<plist version="1.0"><dict>\n'
+                f'  <key>Label</key><string>{SERVICE_LABEL}.{role}</string>\n'
+                f'  <key>ProgramArguments</key><array>\n{args}  </array>\n'
+                '  <key>RunAtLoad</key><true/>\n'
+                '  <key>KeepAlive</key><true/>\n'
+                '  <key>ProcessType</key><string>Interactive</string>\n'
+                f'  <key>StandardOutPath</key><string>{escape(log)}</string>\n'
+                f'  <key>StandardErrorPath</key><string>{escape(log)}</string>\n'
+                '</dict></plist>\n')
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(["launchctl", "bootout", f"{domain}/{SERVICE_LABEL}.{role}"],
+                       capture_output=True)
+        r = subprocess.run(["launchctl", "bootstrap", domain, path], capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"launchctl bootstrap failed: {r.stderr.strip() or r.returncode}")
+        if start:
+            subprocess.run(["launchctl", "kickstart", f"{domain}/{SERVICE_LABEL}.{role}"],
+                           capture_output=True)
+        print(f"installed {path}\nlogs: {log}")
+        return 0
+
+    if system == "Linux":
+        path = _unit_path(role)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cmd = " ".join(shlex.quote(a) for a in argv)
+        with open(path, "w") as fh:
+            fh.write(
+                "[Unit]\n"
+                f"Description={APP} {role}\n"
+                "After=default.target\n\n"
+                "[Service]\n"
+                "Type=simple\n"
+                f"ExecStart={cmd}\n"
+                "Restart=always\n"
+                "RestartSec=5\n\n"
+                "[Install]\n"
+                "WantedBy=default.target\n")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        args = ["systemctl", "--user", "enable"] + (["--now"] if start else []) + [f"{APP}-{role}.service"]
+        r = subprocess.run(args, capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"systemctl failed: {r.stderr.strip() or r.returncode}")
+        print(f"installed {path}\nlogs: journalctl --user -u {APP}-{role} -f")
+        return 0
+
+    if system == "Windows":
+        name = f"{APP}-{role}"
+        # Task Scheduler captures no output at all, so the program logs itself.
+        # --log is an option of pcmlink, not of the interpreter, so it must come
+        # after the whole invocation prefix (python.exe plus the script path).
+        argv = _invocation() + ["--log", log, role] + extra
+        cmd = " ".join(f'"{a}"' if " " in a else a for a in argv)
+        r = subprocess.run(
+            ["schtasks", "/create", "/tn", name, "/tr", cmd, "/sc", "onlogon",
+             "/rl", "limited", "/f"], capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"schtasks failed: {(r.stderr or r.stdout).strip()}")
+        # Restart-on-failure is not expressible via schtasks flags; set it on the
+        # registered task definition through the Schedule.Service COM object.
+        ps = (
+            f"$s=New-Object -ComObject Schedule.Service; $s.Connect(); "
+            f"$t=$s.GetFolder('\\').GetTask('{name}'); $d=$t.Definition; "
+            "$d.Settings.RestartCount=3; $d.Settings.RestartInterval='PT1M'; "
+            "$d.Settings.Hidden=$true; $d.Settings.ExecutionTimeLimit='PT0S'; "
+            "$d.Settings.DisallowStartIfOnBatteries=$false; "
+            "$d.Settings.StopIfGoingOnBatteries=$false; "
+            f"$s.GetFolder('\\').RegisterTaskDefinition('{name}',$d,4,$null,$null,3) | Out-Null"
+        )
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True)
+        if start:
+            subprocess.run(["schtasks", "/run", "/tn", name], capture_output=True)
+        print(f"registered scheduled task {name} (at logon, hidden, restarts on failure)")
+        return 0
+    die(f"service management is not implemented for {system}")
+
+
+def service_uninstall(role: str) -> int:
+    system = platform.system()
+    if system == "Darwin":
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(["launchctl", "bootout", f"{domain}/{SERVICE_LABEL}.{role}"],
+                       capture_output=True)
+        path = _plist_path(role)
+        if os.path.exists(path):
+            os.remove(path)
+        print(f"removed {path}")
+    elif system == "Linux":
+        subprocess.run(["systemctl", "--user", "disable", "--now", f"{APP}-{role}.service"],
+                       capture_output=True)
+        path = _unit_path(role)
+        if os.path.exists(path):
+            os.remove(path)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        print(f"removed {path}")
+    elif system == "Windows":
+        subprocess.run(["schtasks", "/delete", "/tn", f"{APP}-{role}", "/f"], capture_output=True)
+        print(f"removed scheduled task {APP}-{role}")
+    else:
+        die(f"service management is not implemented for {system}")
+    return 0
+
+
+def service_status(role: str) -> int:
+    system = platform.system()
+    if system == "Darwin":
+        r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{SERVICE_LABEL}.{role}"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print("not installed")
+            return 1
+        for line in r.stdout.splitlines():
+            if any(k in line for k in ("state =", "pid =", "last exit", "runs =")):
+                print(line.strip())
+    elif system == "Linux":
+        subprocess.run(["systemctl", "--user", "status", "--no-pager", f"{APP}-{role}.service"])
+    elif system == "Windows":
+        subprocess.run(["schtasks", "/query", "/tn", f"{APP}-{role}", "/v", "/fo", "list"])
+    else:
+        die(f"service management is not implemented for {system}")
+    print(f"logs: {_log_path(role)}")
     return 0
 
 
@@ -438,6 +648,7 @@ def add_shared(sp):
     sp.add_argument("--channels", type=int, help=SETTINGS["channels"][1])
     sp.add_argument("--payload", type=int, help=SETTINGS["payload"][1])
     sp.add_argument("--device", help=SETTINGS["device"][1])
+    sp.add_argument("--volume", type=float, help=SETTINGS["volume"][1])
     sp.add_argument("--gst-launch", dest="gst_launch", help=SETTINGS["gst_launch"][1])
     sp.add_argument("--no-stats", dest="stats", action="store_false", default=None,
                     help="suppress the per-second statistics line")
@@ -448,6 +659,7 @@ def add_shared(sp):
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog=APP, description=__doc__.splitlines()[0])
     p.add_argument("--config", help="explicit config file, bypassing the search path")
+    p.add_argument("--log", help="append output to this file instead of stdout")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("send", help="capture system audio and stream it")
@@ -473,11 +685,34 @@ def main(argv=None) -> int:
     cp = sub.add_parser("config", help="show the config search path and effective values")
     cp.add_argument("--role", choices=["send", "receive"], default="receive")
 
+    vp = sub.add_parser("service",
+                        help="install, remove or inspect the background service")
+    vp.add_argument("action", choices=["install", "uninstall", "status"])
+    vp.add_argument("role", choices=["send", "receive"])
+    vp.add_argument("--no-start", dest="start", action="store_false", default=True,
+                    help="install without starting it now")
+    vp.add_argument("args", nargs=argparse.REMAINDER,
+                    help="arguments for the role, after --")
+
     a = p.parse_args(argv)
+
+    if getattr(a, "log", None):
+        os.makedirs(os.path.dirname(os.path.abspath(a.log)) or ".", exist_ok=True)
+        fh = open(a.log, "a", buffering=1)
+        sys.stdout = fh
+        sys.stderr = fh
 
     if a.cmd == "devices":
         list_devices(a.kind)
         return 0
+
+    if a.cmd == "service":
+        extra = [x for x in a.args if x != "--"]
+        if a.action == "install":
+            return service_install(a.role, extra, a.start)
+        if a.action == "uninstall":
+            return service_uninstall(a.role)
+        return service_status(a.role)
 
     cfg_data, used = load_config(getattr(a, "config", None))
 

@@ -22,6 +22,8 @@ mtu  = 1200             # 1200 gives ~5 ms packets at 48 kHz stereo
 [receive]
 device  = "Scarlett"    # output device name substring, not a raw UID
 latency = 100           # jitterbuffer depth in ms; raise if you hear dropouts
+volume  = 1.0           # software gain; the OS volume slider often does not
+                        # affect a loopback capture, so control level here
 
 # Output device buffering. These are deliberately generous: tight values
 # starve the device and produce clicking.
