@@ -123,6 +123,32 @@ pcmlink-ctl logs        # follow the receiver log
 receiver that is running while the sender is silent reports as **no packets**
 rather than a false green.
 
+## Which endpoint to capture
+
+On Windows this choice decides whether the *sending* machine's volume control
+works, and it is not obvious.
+
+A loopback tap is taken after the software volume stage only on endpoints where
+Windows inserts one. On endpoints that report hardware volume support — which
+includes many virtual sound cards — the tap is full-scale and the volume slider
+has no effect on what is sent.
+
+So capture a **real output endpoint** if you want the sending machine's volume
+keys to work. Capturing a virtual device gives a stream fixed at full scale,
+adjustable only at the receiving end.
+
+With a real endpoint the two controls compose naturally: the sender's volume
+sets the source level, and the receiver's own control sets monitoring level,
+exactly as an application's volume slider and a speaker knob do.
+
+Two consequences worth knowing:
+
+- Anything physically connected to that endpoint will also play the audio. Mute
+  it at the device; that does not affect what is captured.
+- An HDMI endpoint can become inactive when its display sleeps or switches
+  input, which takes the capture with it. A virtual endpoint is more stable but
+  costs you the sender-side volume control.
+
 ## Volume
 
 `--volume` applies a software gain: `1.0` is unity, `0.5` is roughly −6 dB,
