@@ -373,8 +373,13 @@ def run_subprocess(desc: str, cfg: dict) -> int:
         out, err = sys.stdout, sys.stderr
     except Exception:
         out = err = subprocess.DEVNULL
+    # gst-launch-1.0.exe is a console application: without CREATE_NO_WINDOW,
+    # Windows opens a console for it even when the parent is pythonw.exe and the
+    # scheduled task is marked hidden.
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
     try:
-        return subprocess.call(argv, stdout=out, stderr=err)
+        return subprocess.call(argv, stdout=out, stderr=err, creationflags=flags) if flags \
+            else subprocess.call(argv, stdout=out, stderr=err)
     except KeyboardInterrupt:
         return 0
 

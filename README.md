@@ -174,6 +174,10 @@ pipelines:
 - **Big-endian audio is poorly supported by most elements**, which bites more
   than once. `volume` cannot process `S16BE`, so on the sender the gain is
   applied in native byte order and converted afterwards.
+- **A hidden scheduled task does not hide its children.** `gst-launch-1.0.exe`
+  is a console application, so Windows opens a console for it even when the
+  parent is `pythonw.exe` and the task is marked hidden. The child must be
+  spawned with `CREATE_NO_WINDOW`.
 - **`shutil.which()` is unsafe for locating an installed console script on
   Windows**: `PATHEXT` includes `.PY` and the current directory is searched, so
   it will cheerfully return the source file and a generated service will try to
