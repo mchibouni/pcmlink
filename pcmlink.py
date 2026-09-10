@@ -171,24 +171,54 @@ def source_element(cfg: dict, tone: bool) -> str:
                 f"freq={cfg['tone_freq']} volume={cfg['tone_volume']}")
     system = platform.system()
     if system == "Windows":
-        # WASAPI loopback captures an existing render endpoint; no driver needed.
-        # low-latency is deliberately left off: it starves capture and clicks.
-        src = "wasapi2src loopback=true"
-    elif system == "Linux":
-        # A PipeWire/PulseAudio sink monitor is an ordinary capture source.
-        src = "pulsesrc"
-    else:
-        die("system-audio capture is not supported on macOS; "
-            "pcmlink sends from Windows or Linux and receives anywhere")
-    if cfg["device"]:
-        src += f' device="{cfg["device"]}"'
-    return src
+        # WASAPI loopback captures an existing render endpoint, so Windows needs
+        # no virtual sound card. low-latency is deliberately left off: it starves
+        # capture and produces continuous clicking.
+        return "wasapi2src loopback=true"
+    if system == "Linux":
+        # A PipeWire/PulseAudio sink monitor is an ordinary capture source, and
+        # pulsesrc with no device follows the default sink's monitor.
+        return "pulsesrc"
+    die("no default system-audio capture on this platform: pass --device naming "
+        "a capture source, such as a loopback device like BlackHole")
+
+
+def device_launch_fragment(dev) -> str:
+    """Render a Gst.Device as 'factory prop="value"' for a launch string.
+
+    Gst.Device.create_element() configures the element correctly on every
+    platform; we read the settings back rather than guessing which property
+    each platform's element uses (unique-id on macOS, device elsewhere).
+    """
+    el = dev.create_element(None)
+    if el is None:
+        die(f'could not create an element for "{dev.get_display_name()}"')
+    parts = [el.get_factory().get_name()]
+    for prop in ("unique-id", "device", "device-name"):
+        if el.find_property(prop) is None:
+            continue
+        val = el.get_property(prop)
+        if val:
+            parts.append(f'{prop}="{val}"')
+    return " ".join(parts)
+
+
+def has_property(factory_name: str, prop: str) -> bool:
+    Gst, _ = gst()
+    el = Gst.ElementFactory.make(factory_name, None)
+    return el is not None and el.find_property(prop) is not None
 
 
 def build_send(cfg: dict, tone: bool) -> str:
+    if tone or not cfg["device"]:
+        head = source_element(cfg, tone)
+    else:
+        # A named capture source works on any platform, which is how macOS
+        # sends: point it at a loopback device such as BlackHole.
+        head = device_launch_fragment(find_device(cfg["device"], "Source"))
     # S16BE is mandatory on the wire: RTP L16 is big-endian (RFC 3551).
     return (
-        f"{source_element(cfg, tone)} "
+        f"{head} "
         f"! audioconvert ! audioresample "
         f"! audio/x-raw,format=S16BE,rate={cfg['rate']},"
         f"channels={cfg['channels']},layout=interleaved "
@@ -197,12 +227,17 @@ def build_send(cfg: dict, tone: bool) -> str:
     )
 
 
-def build_receive(cfg: dict, uid: str) -> str:
-    darwin = platform.system() == "Darwin"
-    sink = "osxaudiosink" if darwin else "autoaudiosink"
-    dev = f' unique-id="{uid}"' if uid and darwin else ""
-    tail = (f" buffer-time={cfg['buffer_time']} latency-time={cfg['latency_time']}"
-            if darwin else "")
+def build_receive(cfg: dict) -> str:
+    if cfg["device"]:
+        sink = device_launch_fragment(find_device(cfg["device"], "Sink"))
+    else:
+        sink = "autoaudiosink"
+    factory = sink.split()[0]
+    tail = ""
+    if has_property(factory, "buffer-time"):
+        tail += f" buffer-time={cfg['buffer_time']}"
+    if has_property(factory, "latency-time"):
+        tail += f" latency-time={cfg['latency_time']}"
     return (
         f'udpsrc address={cfg["bind"]} port={cfg["port"]} '
         f'caps="application/x-rtp,media=audio,encoding-name=L16,'
@@ -213,7 +248,7 @@ def build_receive(cfg: dict, uid: str) -> str:
         # wire and play byte-swapped samples, which sounds like loud static.
         f"! audio/x-raw,format={cfg['format']},rate={cfg['rate']},"
         f"channels={cfg['channels']} "
-        f"! {sink} name=sink{dev}{tail}"
+        f"! {sink} name=sink{tail}"
     )
 
 
@@ -242,21 +277,23 @@ def list_devices(kind: str):
             print(f"      unique-id: {uid}")
 
 
-def resolve_device(substr: str) -> str:
+def find_device(substr: str, kind: str):
+    """Return the single Gst.Device whose display name contains substr.
+
+    Works for both Sink and Source on every platform; the caller turns it into
+    a configured element with Gst.Device.create_element(), which is portable in
+    a way that per-platform device properties are not.
+    """
     if not substr:
-        return ""
-    devs = _devices("Sink")
+        return None
+    devs = _devices(kind)
     hits = [d for d in devs if substr.lower() in (d.get_display_name() or "").lower()]
     if not hits:
         names = ", ".join(d.get_display_name() for d in devs) or "none"
-        die(f'no audio sink matching "{substr}". Available: {names}')
+        die(f'no audio {kind.lower()} matching "{substr}". Available: {names}')
     if len(hits) > 1:
         die(f'"{substr}" is ambiguous: ' + ", ".join(d.get_display_name() for d in hits))
-    props = hits[0].get_properties()
-    uid = props.get_string("unique-id") if props and props.has_field("unique-id") else ""
-    if not uid:
-        die(f'"{hits[0].get_display_name()}" exposes no unique-id')
-    return uid
+    return hits[0]
 
 
 # ---------------------------------------------------------------- preflight
@@ -299,7 +336,7 @@ def preflight(role: str, cfg: dict, tone: bool) -> list[str]:
             problems.append(f"cannot bind {cfg['bind']}:{cfg['port']} ({exc}); already running?")
         finally:
             sock.close()
-        if cfg["device"] and platform.system() == "Darwin" and Gst is not None:
+        if cfg["device"] and Gst is not None:
             devs = _devices("Sink")
             hits = [d for d in devs if cfg["device"].lower() in (d.get_display_name() or "").lower()]
             if len(hits) != 1:
@@ -465,10 +502,7 @@ def main(argv=None) -> int:
             print(f"{APP}: preflight: {problem}", file=sys.stderr)
         return 2
 
-    uid = ""
-    if role == "receive" and platform.system() == "Darwin" and cfg["device"]:
-        uid = resolve_device(cfg["device"])
-    desc = build_send(cfg, tone) if role == "send" else build_receive(cfg, uid)
+    desc = build_send(cfg, tone) if role == "send" else build_receive(cfg)
 
     if a.dry_run:
         print("config: " + (", ".join(used) if used else "defaults only"))

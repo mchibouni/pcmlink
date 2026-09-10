@@ -1,23 +1,39 @@
 # pcmlink
 
-Uncompressed PCM audio over a LAN. Captures system audio on one machine and
-plays it through a chosen audio interface on another, as RTP/L16 over UDP.
+Point-to-point uncompressed audio over a LAN. Captures audio on one machine and
+plays it through a chosen audio device on another, as RTP/L16 over UDP.
 
-No compression, no discovery, no GUI, no account. One sender, one receiver,
-one UDP port.
+No compression, no discovery, no GUI, no account, no cloud. One sender, one
+receiver, one UDP port.
 
-Built for a specific gap: getting audio out of a Windows VM (or a Linux
-desktop) and into the audio interface attached to a Mac, without a virtual
-sound-card driver on the sending side or a GUI application on either end.
+## Platform support
+
+Any machine can receive. Sending needs something to capture: Windows and Linux
+can capture what the system is playing without extra software, and every
+platform can capture a named input device.
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Receive, with device selection | yes | yes | yes |
+| Send: capture system output | yes (WASAPI loopback) | yes (sink monitor) | needs a loopback device¹ |
+| Send: capture a named input | yes | yes | yes |
+| Live statistics | needs Python bindings | needs Python bindings | needs Python bindings |
+
+¹ macOS has no built-in way to capture its own output. Install a loopback
+device such as BlackHole and pass it with `--device`; it then behaves like any
+other capture source.
+
+Device selection works everywhere because devices are resolved through
+GStreamer's device monitor, which configures the platform's own element —
+`osxaudiosink`, `pulsesink`, `wasapi2sink` — rather than assuming one of them.
 
 ## Requirements
 
 GStreamer 1.20 or newer on both machines.
 
-| Role | Needs |
-|---|---|
-| receive | GStreamer + its Python bindings (for live statistics) |
-| send | GStreamer; the Python bindings are optional — `gst-launch-1.0` is used if absent |
+The receiver additionally wants the GStreamer Python bindings, which is how it
+reports live statistics. The sender works without them by invoking
+`gst-launch-1.0`, which is the normal situation on Windows.
 
 ```sh
 # macOS
@@ -27,32 +43,29 @@ brew install gstreamer pygobject3
 sudo apt install python3-gi gstreamer1.0-plugins-base \
                  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
 
-# Windows: the official MSI from gstreamer.freedesktop.org (choose the
-# complete install). Python bindings are not required for sending.
+# Windows: the official MSI from gstreamer.freedesktop.org, complete install
 ```
 
 ## Use
 
 ```sh
-# What can I play to?
-pcmlink devices
+pcmlink devices                      # what can I play to?
+pcmlink devices --kind Source        # what can I capture from?
 
-# Receiver, on the machine with the audio interface
-pcmlink receive --device Scarlett
+pcmlink receive --device Scarlett    # on the machine with the audio interface
+pcmlink send --host 192.168.1.50     # on the machine making the sound
 
-# Sender, on the machine making the sound
-pcmlink send --host 192.168.1.50
-
-# Prove the path works before blaming the capture side
 pcmlink send --host 192.168.1.50 --test-tone --tone-volume 0.02
-
-# Show the pipeline and validate everything, without starting audio
 pcmlink receive --device Scarlett --dry-run
 ```
 
-Devices are selected by a case-insensitive substring of their name, not by a
-raw device ID. An ambiguous or unmatched name is a preflight failure that
-lists what is actually available.
+Devices are named by a case-insensitive substring, never a raw device ID. A
+name that matches nothing, or matches more than one device, is a preflight
+failure that lists what is actually available.
+
+`--test-tone` replaces captured audio with a sine wave. It is the fastest way
+to tell a transport problem from a capture problem: if the tone is clean and
+real audio is not, the fault is on the capture side.
 
 ## Statistics
 
@@ -70,13 +83,13 @@ The receiver prints one line per second:
 
 `avg` is the useful long-run number. Its absolute value depends on how many
 frames the capture source puts in each buffer, so it differs between sources
-and is not a fixed target: what matters is that it *settles* and then stays
-put. A slow, monotonic drift in `avg`, or in `jb` over tens of minutes, is
-clock drift between the two machines. The averaging window starts at the first
-packet received, not at process start.
+and is not a fixed target: what matters is that it settles and then stays put.
+A slow monotonic drift in `avg`, or in `jb` over tens of minutes, is clock
+drift between the two machines. The averaging window starts at the first packet
+received, not at process start.
 
-Note that GStreamer's jitterbuffer performs its own clock-skew correction, so
-a clean log proves the link is *stable*, not that there is no drift.
+Note that GStreamer's jitterbuffer performs its own clock-skew correction, so a
+clean log proves the link is *stable*, not that there is no drift.
 
 ## Configuration
 
@@ -93,26 +106,26 @@ defaults < system config < user config < ./pcmlink.toml < PCMLINK_* env < CLI fl
 Any setting can be given as an environment variable: `PCMLINK_PORT=6000`,
 `PCMLINK_DEVICE=Scarlett`. See `pcmlink.example.toml` for the full set.
 
-## Notes from the implementation
+## Implementation notes
 
-Two things cost real debugging time and are worth knowing if you modify the
+Two details cost real debugging time and are worth knowing before modifying the
 pipelines:
 
-- **RTP L16 is big-endian** (RFC 3551). If the output element advertises
-  support for `S16BE`, GStreamer will happily hand it byte-swapped samples
-  and the result is loud static rather than an error. The receiver forces an
-  explicit output format to make the conversion happen.
+- **RTP L16 is big-endian** (RFC 3551). If the output element advertises support
+  for `S16BE`, GStreamer will hand it byte-swapped samples and the result is
+  loud static rather than an error. The receiver forces an explicit output
+  format so the conversion actually happens.
 - **Do not set `low-latency=true` on `wasapi2src`.** It starves capture and
-  produces continuous clicking. This is a capture-side fault that looks
-  exactly like packet loss; `--test-tone` distinguishes the two in seconds.
+  produces continuous clicking that looks exactly like packet loss in the
+  statistics, while `lost` stays at zero.
 
 ## Limitations
 
-- macOS can receive but not send: it has no system-audio capture without a
-  third-party virtual device.
-- One sender per receiver. There is no session negotiation; both ends must
-  agree on rate, channels and payload type.
-- Unicast only, and no encryption. Use it on a network you trust.
+- One sender per receiver. There is no session negotiation: both ends must
+  agree on sample rate, channel count and payload type.
+- Unicast only, and unencrypted. Use it on a network you trust.
+- Latency is a buffering choice, not a guarantee. The defaults favour
+  robustness over latency and suit listening rather than monitoring.
 
 ## Licence
 
