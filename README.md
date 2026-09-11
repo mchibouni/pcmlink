@@ -149,6 +149,32 @@ Two consequences worth knowing:
   input, which takes the capture with it. A virtual endpoint is more stable but
   costs you the sender-side volume control.
 
+On Linux the sender captures the default sink's monitor, and PipeWire takes a
+monitor **before** the sink's volume by default, so the volume keys have no
+effect on what is sent. Set `monitor.channel-volumes` on the sink to tap it
+after the volume stage instead. Live, for sink id `56`:
+
+```sh
+pw-cli set-param 56 Props '{ params = [ "monitor.channel-volumes" true ] }'
+```
+
+and persistently with a WirePlumber rule, which applies from the next time
+WirePlumber starts:
+
+```
+# ~/.config/wireplumber/wireplumber.conf.d/51-monitor-volume.conf
+monitor.alsa.rules = [
+  {
+    matches = [ { node.name = "alsa_output.pci-0000_2f_00.4.iec958-stereo" } ]
+    actions = { update-props = { monitor.channel-volumes = true } }
+  }
+]
+```
+
+Verified with a −37 dBFS tone at sink volume 1.0 / 0.54 / 0.25: the tap read
+−37 dBFS at every setting by default, and −37 / −53 / −73 dBFS with the property
+set.
+
 ## Volume
 
 `--volume` applies a software gain: `1.0` is unity, `0.5` is roughly −6 dB,
