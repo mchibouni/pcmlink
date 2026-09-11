@@ -85,7 +85,7 @@ command line works as a service.
 | Platform | Mechanism | Restart behaviour |
 |---|---|---|
 | macOS | hidden login item (`~/Applications/pcmlink.app`) | in-process, `retry_delay` seconds |
-| Linux | systemd `--user` unit | `Restart=always`, `RestartSec=5` |
+| Linux | systemd `--user` unit; `send` is bound to `graphical-session.target` | `Restart=always`, `RestartSec=5` |
 | Windows | Task Scheduler, at logon, hidden | 3 retries at 1-minute intervals |
 
 Windows restarts are noticeably slower than the other two: Task Scheduler's

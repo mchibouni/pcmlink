@@ -585,18 +585,25 @@ def service_install(role: str, extra: list[str], start: bool) -> int:
         path = _unit_path(role)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         cmd = " ".join(shlex.quote(a) for a in argv)
+        # A sender captures what the desktop is playing, so it lives and dies
+        # with the graphical session rather than with the user manager, which
+        # lingers after logout. That also stops it when the session is handed
+        # to something else, such as a passthrough VM that sends on its own.
+        target = "graphical-session.target" if role == "send" else "default.target"
+        part_of = f"PartOf={target}\n" if role == "send" else ""
         with open(path, "w") as fh:
             fh.write(
                 "[Unit]\n"
                 f"Description={APP} {role}\n"
-                "After=default.target\n\n"
+                f"After={target}\n"
+                f"{part_of}\n"
                 "[Service]\n"
                 "Type=simple\n"
                 f"ExecStart={cmd}\n"
                 "Restart=always\n"
                 "RestartSec=5\n\n"
                 "[Install]\n"
-                "WantedBy=default.target\n")
+                f"WantedBy={target}\n")
         subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
         args = ["systemctl", "--user", "enable"] + (["--now"] if start else []) + [f"{APP}-{role}.service"]
         r = subprocess.run(args, capture_output=True, text=True)
