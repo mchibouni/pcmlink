@@ -1,12 +1,19 @@
 #!/bin/sh
 # pcmlink-ctl - start, stop, restart and inspect the audio link.
 #
-# A convenience wrapper for the common two-machine setup: a receiver on this
-# machine and a sender running as a scheduled task on a Windows host reachable
-# over ssh. Written for macOS receivers; adjust the log path elsewhere.
+# A convenience wrapper for the common setup: a receiver on this machine and a
+# sender on a host reachable over ssh. Written for macOS receivers; adjust the
+# log path elsewhere.
 #
-#   receiver (this Mac)   pcmlink.py receive  ->  Focusrite
-#   sender   (Windows VM) scheduled task "pcmlink-send"
+#   receiver (this Mac)      pcmlink.py receive  ->  Focusrite
+#   sender   (Linux host)    systemd --user unit "pcmlink-send", bound to the
+#                            graphical session
+#   sender   (Windows VM)    scheduled task "pcmlink-send"
+#
+# The Linux host and the Windows VM share one display, so at most one of them
+# has a desktop session and only that one should send. The Linux host is asked
+# first: if its graphical session is up, it is the sender and the VM is not
+# queried, which also avoids waiting on ssh timeouts to a VM that is off.
 #
 # The receiver is deliberately started from your shell rather than by launchd:
 # a launchd-spawned process is invisible to SoundSource, so its volume control
@@ -18,9 +25,11 @@ DIR="${PCMLINK_DIR:-$HOME/projects/pcmlink}"
 DEVICE="${PCMLINK_CTL_DEVICE:-Scarlett}"
 VOLUME="${PCMLINK_CTL_VOLUME:-1.0}"
 WIN="${PCMLINK_CTL_WIN_HOST:-win11}"
+LINUX="${PCMLINK_CTL_LINUX_HOST:-pc}"
 LOG="${PCMLINK_CTL_LOG:-$HOME/Library/Logs/pcmlink/receive.log}"
 PY="${PCMLINK_CTL_PYTHON:-python3}"
 TASK=pcmlink-send
+UNIT=pcmlink-send.service
 
 c_ok=$(printf '\033[32m'); c_bad=$(printf '\033[31m'); c_dim=$(printf '\033[2m'); c_off=$(printf '\033[0m')
 
@@ -48,37 +57,62 @@ rx_stop() {
     echo "receiver stopped (was pid $pid)"
 }
 
-# Number of sender pipelines on the remote host. More than one means several
+# systemctl --user on the Linux host. Prints the unit state (active, inactive,
+# failed, ...) or nothing when the host is unreachable.
+linux_q() {
+    ssh -o ConnectTimeout=8 -o BatchMode=yes "$LINUX" "systemctl --user is-active $1" \
+        2>/dev/null | tail -1
+}
+
+# The Linux host owns the display when its graphical session is active.
+linux_has_session() { [ "$(linux_q graphical-session.target)" = active ]; }
+
+# Number of sender pipelines on the Windows VM. More than one means several
 # RTP streams are arriving on the same port with independent sequence numbers,
 # which the receiver scores as enormous packet loss. Ending the scheduled task
 # does not kill processes it already started, so orphans accumulate silently.
-tx_count() {
+win_count() {
     ssh -o ConnectTimeout=8 "$WIN" \
         'powershell -NoProfile -Command "(@(Get-Process gst-launch-1.0 -ErrorAction SilentlyContinue)).Count"' \
         2>/dev/null | tr -d '\r' | tail -1
 }
 
 tx_start() {
+    if linux_has_session; then
+        ssh -o ConnectTimeout=8 -o BatchMode=yes "$LINUX" "systemctl --user start $UNIT" \
+            >/dev/null 2>&1 || { echo "${c_bad}could not start linux sender${c_off}"; return 1; }
+        sleep 3
+        if [ "$(linux_q "$UNIT")" = active ]; then echo "sender started (linux)"
+        else echo "${c_bad}linux sender did not come up${c_off}"; return 1; fi
+        return 0
+    fi
     ssh -o ConnectTimeout=8 "$WIN" "schtasks /run /tn $TASK" >/dev/null 2>&1 || {
         echo "${c_bad}could not start sender${c_off}"; return 1; }
     sleep 6
-    n=$(tx_count)
+    n=$(win_count)
     case "${n:-0}" in
-        1) echo "sender started" ;;
+        1) echo "sender started (windows)" ;;
         0) echo "${c_bad}sender did not come up${c_off}" ; return 1 ;;
         *) echo "${c_bad}warning: $n sender processes running${c_off}" ; return 1 ;;
     esac
 }
 
 tx_stop() {
+    if linux_has_session; then
+        ssh -o ConnectTimeout=8 -o BatchMode=yes "$LINUX" "systemctl --user stop $UNIT" \
+            >/dev/null 2>&1 || true
+        if [ "$(linux_q "$UNIT")" = active ]; then echo "${c_bad}linux sender still running${c_off}"
+        else echo "sender stopped (linux)"; fi
+        return 0
+    fi
     ssh -o ConnectTimeout=8 "$WIN" "schtasks /end /tn $TASK" >/dev/null 2>&1 || true
     # Ending the task leaves its children behind; kill them explicitly.
     ssh -o ConnectTimeout=8 "$WIN" \
         'powershell -NoProfile -Command "Stop-Process -Name gst-launch-1.0,pythonw -Force -ErrorAction SilentlyContinue"' \
         >/dev/null 2>&1 || true
     sleep 2
-    n=$(tx_count)
-    if [ "${n:-0}" = "0" ]; then echo "sender stopped"
+    n=$(win_count)
+    if [ "${n:-0}" = "0" ]; then echo "sender stopped (windows)"
     else echo "${c_bad}sender still has $n process(es)${c_off}"; fi
 }
 
@@ -93,6 +127,28 @@ flow() {
     echo "$b" | grep -qE 'pkt/s= *[1-9]' || return 1
 }
 
+tx_status() {
+    session=$(linux_q graphical-session.target)
+    if [ "$session" = active ]; then
+        case "$(linux_q "$UNIT")" in
+            active) printf '%srunning%s  linux (%s)\n' "$c_ok" "$c_off" "$LINUX" ;;
+            *)      printf '%sstopped%s  linux (%s) has the desktop session\n' "$c_bad" "$c_off" "$LINUX" ;;
+        esac
+        return 0
+    fi
+    if [ -z "$session" ]; then
+        printf '%slinux unreachable%s (%s), ' "$c_dim" "$c_off" "$LINUX"
+    fi
+    n=$(win_count)
+    case "${n:-}" in
+        1)  printf '%srunning%s  windows (%s)\n' "$c_ok" "$c_off" "$WIN" ;;
+        0)  printf '%sstopped%s  windows (%s)\n' "$c_bad" "$c_off" "$WIN" ;;
+        "") printf '%sunreachable%s (%s)\n' "$c_bad" "$c_off" "$WIN" ;;
+        *)  printf '%s%s processes on windows - duplicates cause false packet loss%s\n' \
+                "$c_bad" "$n" "$c_off" ;;
+    esac
+}
+
 status() {
     printf 'receiver  '
     pid=$(rx_pid) || true
@@ -104,14 +160,7 @@ status() {
     fi
 
     printf 'sender    '
-    n=$(tx_count)
-    case "${n:-}" in
-        1)  printf '%srunning%s\n' "$c_ok" "$c_off" ;;
-        0)  printf '%sstopped%s\n' "$c_bad" "$c_off" ;;
-        "") printf '%sunreachable%s (%s)\n' "$c_bad" "$c_off" "$WIN" ;;
-        *)  printf '%s%s processes - duplicates cause false packet loss%s\n' \
-                "$c_bad" "$n" "$c_off" ;;
-    esac
+    tx_status
 
     printf 'audio     '
     if [ -n "${pid:-}" ] && flow; then printf '%sflowing%s\n' "$c_ok" "$c_off"
@@ -131,6 +180,14 @@ status() {
     printf '%s%s%s\n' "$c_dim" "$(tail -1 "$LOG" 2>/dev/null)" "$c_off"
 }
 
+sender_logs() {
+    if linux_has_session; then
+        ssh -t "$LINUX" "journalctl --user -u $UNIT -n 30 -f"
+    else
+        ssh "$WIN" 'powershell -NoProfile -c "Get-Content \"$env:LOCALAPPDATA\pcmlink\send.log\" -Tail 30 -Wait"'
+    fi
+}
+
 case "${1:-status}" in
     status)   status ;;
     start)    rx_start; tx_start ;;
@@ -139,7 +196,7 @@ case "${1:-status}" in
     restart-rx|rx) rx_stop; sleep 1; rx_start ;;
     restart-tx|tx) tx_stop; sleep 1; tx_start ;;
     logs)     tail -f "$LOG" ;;
-    sender-logs) ssh "$WIN" 'powershell -NoProfile -c "Get-Content \"$env:LOCALAPPDATA\pcmlink\send.log\" -Tail 30 -Wait"' ;;
+    sender-logs) sender_logs ;;
     *) cat <<USAGE
 usage: pcmlink-ctl [command]
 
@@ -147,17 +204,18 @@ usage: pcmlink-ctl [command]
   start|stop    both ends
   restart       both ends, then show status
   restart-rx    receiver only (this Mac)
-  restart-tx    sender only (Windows VM)
+  restart-tx    sender only (Linux host if it has the desktop session, else Windows VM)
   logs          follow the receiver log
-  sender-logs   follow the sender log over ssh
+  sender-logs   follow the active sender's log over ssh
 
 environment:
-  PCMLINK_CTL_DEVICE     output device substring          (default: Scarlett)
-  PCMLINK_CTL_VOLUME     software gain                    (default: 1.0)
-  PCMLINK_CTL_WIN_HOST   ssh host alias of the sender     (default: win11)
-  PCMLINK_CTL_LOG        receiver log path
-  PCMLINK_CTL_PYTHON     interpreter to run the receiver  (default: python3)
-  PCMLINK_DIR            checkout containing pcmlink.py
+  PCMLINK_CTL_DEVICE      output device substring             (default: Scarlett)
+  PCMLINK_CTL_VOLUME      software gain                       (default: 1.0)
+  PCMLINK_CTL_LINUX_HOST  ssh host alias of the Linux sender  (default: pc)
+  PCMLINK_CTL_WIN_HOST    ssh host alias of the Windows VM    (default: win11)
+  PCMLINK_CTL_LOG         receiver log path
+  PCMLINK_CTL_PYTHON      interpreter to run the receiver     (default: python3)
+  PCMLINK_DIR             checkout containing pcmlink.py
 USAGE
        exit 1 ;;
 esac
