@@ -179,9 +179,11 @@ def source_element(cfg: dict, tone: bool) -> str:
         # capture and produces continuous clicking.
         return "wasapi2src loopback=true"
     if system == "Linux":
-        # A PipeWire/PulseAudio sink monitor is an ordinary capture source, and
-        # pulsesrc with no device follows the default sink's monitor.
-        return "pulsesrc"
+        # A PipeWire/PulseAudio sink monitor is an ordinary capture source. Name
+        # it explicitly: pulsesrc with no device opens the default *source*,
+        # which is only the monitor while no microphone is present, so plugging
+        # in a webcam would silently switch the stream to its microphone.
+        return "pulsesrc device=@DEFAULT_MONITOR@"
     die("no default system-audio capture on this platform: pass --device naming "
         "a capture source, such as a loopback device like BlackHole")
 
