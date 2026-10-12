@@ -116,12 +116,20 @@ reachable over ssh.
 pcmlink-ctl status      # both ends, and whether packets are actually moving
 pcmlink-ctl restart     # restart both, then report
 pcmlink-ctl restart-tx  # sender only
+pcmlink-ctl start-rx    # receiver only, and only if it is not already running
 pcmlink-ctl logs        # follow the receiver log
 ```
 
 `status` samples the log twice and requires a non-zero packet rate, so a
 receiver that is running while the sender is silent reports as **no packets**
-rather than a false green.
+rather than a false green. It also shows the output device and the sample rate
+it is running at, which is the rate set by whatever the interface is clocked
+from when it is not the clock master.
+
+`start-rx` does nothing if a receiver is already running, so it is safe to run
+at login from something that runs inside your desktop session, such as
+Hammerspoon or a login item. Don't use launchd: a receiver started by launchd
+is invisible to SoundSource.
 
 ## Which endpoint to capture
 

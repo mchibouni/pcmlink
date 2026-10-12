@@ -33,8 +33,16 @@ UNIT=pcmlink-send.service
 
 c_ok=$(printf '\033[32m'); c_bad=$(printf '\033[31m'); c_dim=$(printf '\033[2m'); c_off=$(printf '\033[0m')
 
-rx_pid() { pgrep -f "pcmlink.py receive" 2>/dev/null | head -1; }
-rx_count() { pgrep -f "pcmlink.py receive" 2>/dev/null | wc -l | tr -d ' '; }
+# The receiver is the process whose argv[0] is a Python interpreter running
+# "pcmlink.py receive". Anchoring on argv[0] matters: a bare
+# `pgrep -f "pcmlink.py receive"` also matches any shell whose command line
+# merely contains that text (a script checking on the receiver, say). start-rx
+# then takes that shell for a running receiver and starts nothing, and pkill
+# kills the shell.
+RX_MATCH='^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive'
+
+rx_pid() { pgrep -f "$RX_MATCH" 2>/dev/null | head -1; }
+rx_count() { pgrep -f "$RX_MATCH" 2>/dev/null | wc -l | tr -d ' '; }
 
 rx_start() {
     if [ -n "$(rx_pid)" ]; then echo "receiver already running (pid $(rx_pid))"; return 0; fi
@@ -52,7 +60,7 @@ rx_start() {
 rx_stop() {
     pid=$(rx_pid) || true
     if [ -z "${pid:-}" ]; then echo "receiver not running"; return 0; fi
-    pkill -f "pcmlink.py receive" 2>/dev/null || true
+    pkill -f "$RX_MATCH" 2>/dev/null || true
     sleep 1
     echo "receiver stopped (was pid $pid)"
 }
@@ -149,6 +157,19 @@ tx_status() {
     esac
 }
 
+# The output device and the rate it is actually running at. When the interface
+# takes its clock from another unit (ADAT, word clock), that unit sets the rate,
+# not this Mac, so a change upstream shows up here first.
+dev_status() {
+    line=$(system_profiler SPAudioDataType 2>/dev/null | awk -v dev="$DEVICE" '
+        /^        [^ ].*:$/ { inblk = index($0, dev) > 0; name = $0 }
+        inblk && /Current SampleRate/ {
+            gsub(/^ +/, "", name); sub(/:$/, "", name); print name " @ " $3 " Hz"; exit
+        }')
+    if [ -n "$line" ]; then printf '%s\n' "$line"
+    else printf '%sno device matching "%s"%s\n' "$c_bad" "$DEVICE" "$c_off"; fi
+}
+
 status() {
     printf 'receiver  '
     pid=$(rx_pid) || true
@@ -158,6 +179,9 @@ status() {
     if [ "$(rx_count)" -gt 1 ]; then
         printf '          %swarning: %s receiver processes%s\n' "$c_bad" "$(rx_count)" "$c_off"
     fi
+
+    printf 'device    '
+    dev_status
 
     printf 'sender    '
     tx_status
@@ -195,6 +219,8 @@ case "${1:-status}" in
     restart)  tx_stop; rx_stop; sleep 1; rx_start; tx_start; sleep 3; echo; status ;;
     restart-rx|rx) rx_stop; sleep 1; rx_start ;;
     restart-tx|tx) tx_stop; sleep 1; tx_start ;;
+    start-rx) rx_start ;;
+    stop-rx)  rx_stop ;;
     logs)     tail -f "$LOG" ;;
     sender-logs) sender_logs ;;
     *) cat <<USAGE
@@ -204,6 +230,8 @@ usage: pcmlink-ctl [command]
   start|stop    both ends
   restart       both ends, then show status
   restart-rx    receiver only (this Mac)
+  start-rx      receiver only, and only if it is not running; safe to call at login
+  stop-rx       receiver only
   restart-tx    sender only (Linux host if it has the desktop session, else Windows VM)
   logs          follow the receiver log
   sender-logs   follow the active sender's log over ssh
