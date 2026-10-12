@@ -5,7 +5,7 @@
 # sender on a host reachable over ssh. Written for macOS receivers; adjust the
 # log path elsewhere.
 #
-#   receiver (this Mac)      pcmlink.py receive  ->  Focusrite
+#   receiver (this Mac)      pcmlink.py receive  ->  RME Babyface
 #   sender   (Linux host)    systemd --user unit "pcmlink-send", bound to the
 #                            graphical session
 #   sender   (Windows VM)    scheduled task "pcmlink-send"
@@ -22,7 +22,7 @@
 set -eu
 
 DIR="${PCMLINK_DIR:-$HOME/projects/pcmlink}"
-DEVICE="${PCMLINK_CTL_DEVICE:-Scarlett}"
+DEVICE="${PCMLINK_CTL_DEVICE:-Babyface}"
 VOLUME="${PCMLINK_CTL_VOLUME:-1.0}"
 WIN="${PCMLINK_CTL_WIN_HOST:-win11}"
 LINUX="${PCMLINK_CTL_LINUX_HOST:-pc}"
@@ -209,7 +209,7 @@ usage: pcmlink-ctl [command]
   sender-logs   follow the active sender's log over ssh
 
 environment:
-  PCMLINK_CTL_DEVICE      output device substring             (default: Scarlett)
+  PCMLINK_CTL_DEVICE      output device substring             (default: Babyface)
   PCMLINK_CTL_VOLUME      software gain                       (default: 1.0)
   PCMLINK_CTL_LINUX_HOST  ssh host alias of the Linux sender  (default: pc)
   PCMLINK_CTL_WIN_HOST    ssh host alias of the Windows VM    (default: win11)
