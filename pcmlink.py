@@ -797,16 +797,40 @@ def _install_login_item(role: str, extra: list[str], start: bool) -> int:
     return 0
 
 
+def _login_item_exists() -> bool:
+    script = 'tell application "System Events" to get the name of every login item'
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    return r.returncode == 0 and APP in [n.strip() for n in r.stdout.split(",")]
+
+
+def _bundle_pids(app: str) -> list[str]:
+    """Running copies of the bundle: their argv[0] is the interpreter inside it."""
+    r = subprocess.run(["pgrep", "-f", "^" + re.escape(os.path.join(app, "Contents", "MacOS")) + "/"],
+                       capture_output=True, text=True)
+    return r.stdout.split()
+
+
 def service_uninstall(role: str) -> int:
     system = platform.system()
     if system == "Darwin":
-        domain = f"gui/{os.getuid()}"
-        subprocess.run(["launchctl", "bootout", f"{domain}/{SERVICE_LABEL}.{role}"],
-                       capture_output=True)
+        # What install creates: a hidden login item pointing at an app bundle.
+        app = _app_bundle_path()
+        script = (f'tell application "System Events" to delete '
+                  f'(every login item whose name is "{APP}")')
+        subprocess.run(["osascript", "-e", script], capture_output=True)
+        pids = _bundle_pids(app)
+        if pids:
+            subprocess.run(["kill"] + pids, capture_output=True)
+        if os.path.isdir(app):
+            shutil.rmtree(app)
+        print(f"removed the {APP} login item and {app}" + (f" (stopped pid {' '.join(pids)})" if pids else ""))
+        # Earlier versions installed a launchd agent instead; remove one if it is left.
         path = _plist_path(role)
         if os.path.exists(path):
+            subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{SERVICE_LABEL}.{role}"],
+                           capture_output=True)
             os.remove(path)
-        print(f"removed {path}")
+            print(f"removed the old launchd agent {path}")
     elif system == "Linux":
         subprocess.run(["systemctl", "--user", "disable", "--now", f"{APP}-{role}.service"],
                        capture_output=True)
@@ -826,14 +850,17 @@ def service_uninstall(role: str) -> int:
 def service_status(role: str) -> int:
     system = platform.system()
     if system == "Darwin":
-        r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{SERVICE_LABEL}.{role}"],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
+        app = _app_bundle_path()
+        installed = os.path.isdir(app) and _login_item_exists()
+        if os.path.exists(_plist_path(role)):
+            print(f"note: an old launchd agent is still installed: {_plist_path(role)} "
+                  f"(`{APP} service uninstall {role}` removes it)")
+        if not installed:
             print("not installed")
             return 1
-        for line in r.stdout.splitlines():
-            if any(k in line for k in ("state =", "pid =", "last exit", "runs =")):
-                print(line.strip())
+        pids = _bundle_pids(app)
+        print(f"login item: {app}")
+        print(f"state = {'running, pid ' + ' '.join(pids) if pids else 'not running'}")
     elif system == "Linux":
         subprocess.run(["systemctl", "--user", "status", "--no-pager", f"{APP}-{role}.service"])
     elif system == "Windows":
