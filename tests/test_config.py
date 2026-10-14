@@ -70,7 +70,13 @@ class Precedence(unittest.TestCase):
         self.assertIs(self.resolve({})["stats"], False)
 
 
+def _have_toml() -> bool:
+    import importlib.util
+    return any(importlib.util.find_spec(m) for m in ("tomllib", "tomli"))
+
+
 class ConfigFiles(unittest.TestCase):
+    @unittest.skipUnless(_have_toml(), "needs Python 3.11+ or tomli")
     def test_explicit_file_is_loaded(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "c.toml")
@@ -114,6 +120,57 @@ class Pipelines(unittest.TestCase):
     def test_tone_volume_is_applied(self):
         desc = pcmlink.build_send(self.cfg(host="10.0.0.1", tone_volume=0.02), tone=True)
         self.assertIn("volume=0.02", desc)
+
+    def test_jack_taps_the_named_ports(self):
+        desc = pcmlink.build_send(self.cfg(host="10.0.0.1", jack="crone:output_[12]"), tone=False)
+        self.assertTrue(desc.startswith("jackaudiosrc "))
+        # Without the pattern, connect=auto would wire up the physical inputs.
+        self.assertIn('port-pattern="crone:output_[12]"', desc)
+        self.assertNotIn("pulsesrc", desc)
+
+    def test_jack_wins_over_a_named_device(self):
+        # build_send must not try to resolve the device through GStreamer.
+        cfg = self.cfg(host="10.0.0.1", jack="system:capture_.*", device="Anything")
+        self.assertIn("jackaudiosrc", pcmlink.build_send(cfg, tone=False))
+
+    def test_tone_wins_over_jack(self):
+        desc = pcmlink.build_send(self.cfg(host="10.0.0.1", jack="crone:output_[12]"), tone=True)
+        self.assertIn("audiotestsrc", desc)
+        self.assertNotIn("jackaudiosrc", desc)
+
+
+    def test_receiver_plays_into_the_named_jack_ports(self):
+        desc = pcmlink.build_receive(self.cfg(jack="crone:input_[12]"))
+        self.assertIn('jackaudiosink connect=auto port-pattern="crone:input_[12]"', desc)
+        self.assertNotIn("autoaudiosink", desc)
+
+
+class Toml(unittest.TestCase):
+    def test_no_config_file_needs_no_toml_module(self):
+        # Python < 3.11 has no tomllib; with nothing to read, it must not matter.
+        with tempfile.TemporaryDirectory() as d:
+            env = {"XDG_CONFIG_DIRS": d, "XDG_CONFIG_HOME": d, "HOME": d}
+            cwd = os.getcwd()
+            old = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
+            os.chdir(d)
+            try:
+                saved = sys.modules.get("tomllib")
+                sys.modules["tomllib"] = None  # type: ignore[assignment]  # makes "import tomllib" fail
+                try:
+                    self.assertEqual(pcmlink.load_config(None), ({}, []))
+                finally:
+                    if saved is None:
+                        del sys.modules["tomllib"]
+                    else:
+                        sys.modules["tomllib"] = saved
+            finally:
+                os.chdir(cwd)
+                for k, v in old.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
 
 
 if __name__ == "__main__":

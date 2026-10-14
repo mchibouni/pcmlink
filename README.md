@@ -17,6 +17,8 @@ platform can capture a named input device.
 | Receive, with device selection | yes | yes | yes |
 | Send: capture system output | yes (WASAPI loopback) | yes (sink monitor) | needs a loopback device¹ |
 | Send: capture a named input | yes | yes | yes |
+| Send: capture a JACK graph | no | yes (`--jack`) | no |
+| Receive: play into a JACK graph | no | yes (`--jack`) | no |
 | Live statistics | needs Python bindings | needs Python bindings | needs Python bindings |
 
 ¹ macOS has no built-in way to capture its own output. Install a loopback
@@ -182,6 +184,69 @@ monitor.alsa.rules = [
 Verified with a −37 dBFS tone at sink volume 1.0 / 0.54 / 0.25: the tap read
 −37 dBFS at every setting by default, and −37 / −53 / −73 dBFS with the property
 set.
+
+## JACK systems (norns)
+
+A machine that runs JACK alone, with no PipeWire or PulseAudio, has no sink
+monitor to capture. `--jack` takes a regular expression naming JACK output
+ports and taps them directly. A monome norns is the case this was written for:
+its whole mix, after the reverb, compressor and tape, leaves on
+`crone:output_1` and `crone:output_2`.
+
+```sh
+pcmlink send --host 192.168.100.24 --port 5006 --jack 'crone:output_[12]'
+```
+
+Run it as the user that owns the JACK server. Without a pattern JACK would
+connect the *physical capture* ports, which are the inputs.
+
+Notes from a norns shield (Raspberry Pi 3B+, Debian 11):
+
+- Debian 11 has GStreamer 1.18, which is enough for a JACK sender:
+  `sudo apt install --no-install-recommends gstreamer1.0-tools
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good` (`jackaudiosrc` is in
+  plugins-good). The sender then runs through `gst-launch-1.0`.
+- Python 3.9 is fine without a config file; use flags or `PCMLINK_*` variables,
+  or install `tomli` to read one.
+- Run it as a **system** unit with `User=` set to the JACK user, ordered after
+  the unit that creates the ports, and `PartOf=` that unit: JACK drops the
+  connections when the port owner restarts, and nothing reconnects them.
+  On a norns that is `After=norns-crone.service`, `PartOf=norns-crone.service`,
+  `WantedBy=norns.target`.
+- If new JACK clients fail with "Cannot connect to server socket" while JACK is
+  plainly running, logind has removed JACK's files in `/dev/shm` at the end of
+  an ssh session. Set `RemoveIPC=no` in a `logind.conf.d` drop-in (norns does so
+  upstream from late 2026) and restart JACK.
+- Give it its own port and its own receiver. Two senders on one port arrive as
+  one stream with clashing sequence numbers, which the receiver scores as heavy
+  packet loss. `contrib/pcmlink-ctl` runs the norns link on 5006 next to the
+  main one.
+
+The other way, `receive --jack` plays into JACK *input* ports instead of an
+audio device. On a norns, `crone:input_1` and `crone:input_2` are its input,
+so scripts process the stream as if it came in through the jack:
+
+```sh
+pcmlink receive --port 5008 --jack 'crone:input_[12]'
+```
+
+A JACK receiver needs no Python bindings (it looks up no device), so it runs
+through `gst-launch-1.0` on a stock norns.
+
+### Feeding a norns from a Mac
+
+`contrib/systap` captures the Mac's system audio with a Core Audio process tap
+(macOS 14.2+), so no loopback device is needed, and leaves out the processes
+named with `--exclude-pid`. `pcmlink-ctl start-norns-in` uses it to send the
+Mac's audio to a norns receiver on port 5008, leaving out the norns' own
+receiver and SoundSource's `arkaudiod` (which replays the audio it processes).
+Otherwise the norns' sound would come back into the capture and loop. macOS
+asks once for System Audio Recording permission for the app that runs it.
+
+```sh
+swiftc -O contrib/systap/systap.swift -o contrib/systap/systap
+pcmlink-ctl start-norns-in      # and stop-norns-in
+```
 
 ## Volume
 

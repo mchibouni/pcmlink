@@ -13,12 +13,14 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import re
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
 import time
+from typing import NoReturn
 
 APP = "pcmlink"
 CONFIG_BASENAME = "config.toml"
@@ -39,6 +41,11 @@ SETTINGS: dict[str, tuple[object, str]] = {
     "buffer_time":  (100000,   "output device buffer in microseconds"),
     "latency_time": (20000,    "output device period in microseconds"),
     "device":       ("",       "device name substring; empty means system default"),
+    "jack":         ("",       "JACK ports matching this regex instead of an audio "
+                               "device: the sender captures these output ports (on a "
+                               "norns, crone:output_[12] is the main mix), the receiver "
+                               "plays into these input ports (crone:input_[12] feeds "
+                               "the norns input)"),
     "format":       ("F32LE",  "sample format handed to the output device"),
     "volume":       (1.0,      "software gain, 1.0 = unity, 0.5 = -6 dB, 2.0 = +6 dB"),
     "stats":        (True,     "print one statistics line per second"),
@@ -51,7 +58,7 @@ SETTINGS: dict[str, tuple[object, str]] = {
 DEFAULTS = {k: v for k, (v, _) in SETTINGS.items()}
 
 
-def die(msg: str, code: int = 1):
+def die(msg: str, code: int = 1) -> NoReturn:
     print(f"{APP}: {msg}", file=sys.stderr)
     sys.exit(code)
 
@@ -84,13 +91,30 @@ def config_paths() -> list[str]:
     return paths
 
 
+def _toml():
+    """tomllib, imported only when there is a file to read.
+
+    tomllib arrived in Python 3.11. Older systems (Debian 11 ships 3.9, which is
+    what a norns runs) can still be configured with flags and PCMLINK_*
+    variables, or read files through the tomli backport.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            die("reading a config file needs Python 3.11+ or the tomli package; "
+                "use flags or PCMLINK_* environment variables instead")
+    return tomllib
+
+
 def load_config(explicit: str | None) -> tuple[dict, list[str]]:
-    import tomllib
     if explicit:
         if not os.path.isfile(explicit):
             die(f"config file not found: {explicit}")
         with open(explicit, "rb") as fh:
-            return tomllib.load(fh), [explicit]
+            return _toml().load(fh), [explicit]
     merged: dict = {}
     used: list[str] = []
     for path in config_paths():
@@ -98,7 +122,7 @@ def load_config(explicit: str | None) -> tuple[dict, list[str]]:
             continue
         with open(path, "rb") as fh:
             try:
-                data = tomllib.load(fh)
+                data = _toml().load(fh)
             except Exception as exc:
                 die(f"{path}: {exc}")
         for key, val in data.items():
@@ -155,6 +179,13 @@ def gst(required: bool = True):
     return Gst, GLib
 
 
+def needs_bindings(cfg: dict, role: str) -> bool:
+    """A receiver looks its output device up through the Python bindings; one
+    that plays into JACK needs no lookup, so gst-launch-1.0 is enough (a norns
+    has no python3-gi)."""
+    return role == "receive" and not cfg["jack"]
+
+
 def find_gst_launch(cfg: dict) -> str | None:
     if cfg["gst_launch"]:
         return cfg["gst_launch"] if os.path.isfile(cfg["gst_launch"]) else None
@@ -172,6 +203,13 @@ def source_element(cfg: dict, tone: bool) -> str:
     if tone:
         return (f"audiotestsrc is-live=true wave=sine "
                 f"freq={cfg['tone_freq']} volume={cfg['tone_volume']}")
+    if cfg["jack"]:
+        # Tap a JACK graph directly, for systems that have no desktop sound
+        # server: a norns runs JACK alone, with its main mix on crone:output_1/2.
+        # Without port-pattern, connect=auto would pick the physical capture
+        # ports, which are the inputs rather than what is playing.
+        return (f'jackaudiosrc connect=auto port-pattern="{cfg["jack"]}" '
+                f"client-name={APP}")
     system = platform.system()
     if system == "Windows":
         # WASAPI loopback captures an existing render endpoint, so Windows needs
@@ -210,12 +248,15 @@ def device_launch_fragment(dev) -> str:
 
 def has_property(factory_name: str, prop: str) -> bool:
     Gst, _ = gst()
+    # Check first: newer PyGObject raises on make() for a missing element.
+    if Gst.ElementFactory.find(factory_name) is None:
+        return False
     el = Gst.ElementFactory.make(factory_name, None)
     return el is not None and el.find_property(prop) is not None
 
 
 def build_send(cfg: dict, tone: bool) -> str:
-    if tone or not cfg["device"]:
+    if tone or cfg["jack"] or not cfg["device"]:
         head = source_element(cfg, tone)
     else:
         # A named capture source works on any platform, which is how macOS
@@ -237,15 +278,20 @@ def build_send(cfg: dict, tone: bool) -> str:
 
 
 def build_receive(cfg: dict) -> str:
-    if cfg["device"]:
+    if cfg["jack"]:
+        # Without port-pattern, connect=auto would wire up the physical outputs.
+        sink = (f'jackaudiosink connect=auto port-pattern="{cfg["jack"]}" '
+                f"client-name={APP}-in")
+    elif cfg["device"]:
         sink = device_launch_fragment(find_device(cfg["device"], "Sink"))
     else:
         sink = "autoaudiosink"
     factory = sink.split()[0]
     tail = ""
-    if has_property(factory, "buffer-time"):
+    # jackaudiosink has both; asking would need the Python bindings.
+    if factory == "jackaudiosink" or has_property(factory, "buffer-time"):
         tail += f" buffer-time={cfg['buffer_time']}"
-    if has_property(factory, "latency-time"):
+    if factory == "jackaudiosink" or has_property(factory, "latency-time"):
         tail += f" latency-time={cfg['latency_time']}"
     return (
         f'udpsrc address={cfg["bind"]} port={cfg["port"]} '
@@ -311,11 +357,38 @@ def find_device(substr: str, kind: str):
 
 # ---------------------------------------------------------------- preflight
 
+def jack_problems(pattern: str) -> list[str]:
+    """Check that the JACK ports to tap exist now.
+
+    jackaudiosrc connects whatever matches when the pipeline starts and never
+    looks again, so a sender started before the ports' owner (at boot, say)
+    would run happily and send silence forever. Failing here instead lets the
+    service manager retry until the ports appear. JACK matches port names with
+    an unanchored extended regex, as re.search does.
+    """
+    lsp = shutil.which("jack_lsp")
+    if not lsp:
+        return []  # cannot check; the pipeline will report a missing server
+    try:
+        r = subprocess.run([lsp], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"jack_lsp failed: {exc}"]
+    if r.returncode != 0:
+        return ["JACK server not reachable (jack_lsp failed)"]
+    try:
+        rx = re.compile(pattern)
+    except re.error as exc:
+        return [f"bad --jack pattern {pattern!r}: {exc}"]
+    if not any(rx.search(port) for port in r.stdout.splitlines()):
+        return [f'no JACK ports match "{pattern}" (yet)']
+    return []
+
+
 def preflight(role: str, cfg: dict, tone: bool) -> list[str]:
     problems: list[str] = []
-    Gst, _ = gst(required=(role == "receive"))
+    Gst, _ = gst(required=needs_bindings(cfg, role))
 
-    if role == "send" and Gst is None and not find_gst_launch(cfg):
+    if Gst is None and not find_gst_launch(cfg):
         problems.append(
                 "neither GStreamer Python bindings nor gst-launch-1.0 found "
                 "(set gst_launch in config, or PCMLINK_GST_LAUNCH)")
@@ -323,14 +396,25 @@ def preflight(role: str, cfg: dict, tone: bool) -> list[str]:
         common = ["audioconvert", "audioresample", "capsfilter"]
         if role == "send":
             need = common + ["rtpL16pay", "udpsink"]
-            need += ["audiotestsrc"] if tone else {
-                "Windows": ["wasapi2src"], "Linux": ["pulsesrc"]}.get(platform.system(), [])
+            if tone:
+                need += ["audiotestsrc"]
+            elif cfg["jack"]:
+                need += ["jackaudiosrc"]
+            else:
+                need += {"Windows": ["wasapi2src"],
+                         "Linux": ["pulsesrc"]}.get(platform.system(), [])
         else:
             need = common + ["udpsrc", "rtpjitterbuffer", "rtpL16depay"]
-            need += ["osxaudiosink"] if platform.system() == "Darwin" else ["autoaudiosink"]
+            if cfg["jack"]:
+                need += ["jackaudiosink"]
+            else:
+                need += ["osxaudiosink"] if platform.system() == "Darwin" else ["autoaudiosink"]
         missing = [e for e in need if Gst.ElementFactory.find(e) is None]
         if missing:
             problems.append(f"missing GStreamer elements: {', '.join(missing)}")
+
+    if cfg["jack"] and not (role == "send" and tone):
+        problems += jack_problems(cfg["jack"])
 
     if not 0.0 <= float(cfg["volume"]) <= 8.0:
         problems.append(f"volume {cfg['volume']} out of range (0.0 to 8.0)")
@@ -395,7 +479,7 @@ def run(desc: str, cfg: dict, role: str) -> int:
     SoundSource, while one launched from the GUI session is, so respawning
     must not mean being respawned by a daemon.
     """
-    Gst, GLib = gst(required=(role == "receive"))
+    Gst, GLib = gst(required=needs_bindings(cfg, role))
     if Gst is None:
         return run_subprocess(desc, cfg)
     while True:
@@ -786,6 +870,7 @@ def main(argv=None) -> int:
     add_shared(sp)
     sp.add_argument("--host", help=SETTINGS["host"][1])
     sp.add_argument("--mtu", type=int, help=SETTINGS["mtu"][1])
+    sp.add_argument("--jack", help=SETTINGS["jack"][1])
     sp.add_argument("--test-tone", action="store_true",
                     help="send a sine wave instead of captured audio")
     sp.add_argument("--tone-freq", dest="tone_freq", type=int, help=SETTINGS["tone_freq"][1])
@@ -798,6 +883,7 @@ def main(argv=None) -> int:
     rp.add_argument("--buffer-time", dest="buffer_time", type=int, help=SETTINGS["buffer_time"][1])
     rp.add_argument("--latency-time", dest="latency_time", type=int, help=SETTINGS["latency_time"][1])
     rp.add_argument("--format", help=SETTINGS["format"][1])
+    rp.add_argument("--jack", help=SETTINGS["jack"][1])
 
     dp = sub.add_parser("devices", help="list audio devices")
     dp.add_argument("--kind", choices=["Sink", "Source"], default="Sink")
