@@ -194,7 +194,7 @@ its whole mix, after the reverb, compressor and tape, leaves on
 `crone:output_1` and `crone:output_2`.
 
 ```sh
-pcmlink send --host 192.168.100.24 --port 5006 --jack 'crone:output_[12]'
+pcmlink send --host 192.168.1.50 --port 5006 --jack 'crone:output_[12]'
 ```
 
 Run it as the user that owns the JACK server. Without a pattern JACK would
