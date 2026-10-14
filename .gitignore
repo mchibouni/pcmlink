@@ -6,3 +6,4 @@ venv/
 pcmlink.toml
 .DS_Store
 macos/
+contrib/systap/systap

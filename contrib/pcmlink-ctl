@@ -10,6 +10,29 @@
 #                            graphical session
 #   sender   (Windows VM)    scheduled task "pcmlink-send"
 #
+# A second, independent link carries a norns (monome) to the same interface:
+#
+#   receiver (this Mac)      pcmlink.py receive --port 5006  ->  RME Babyface
+#   sender   (norns)         system unit "pcmlink-send", tapping JACK
+#                            crone:output_1/2 (the norns main mix)
+#
+# It has its own port and log, so starting, stopping or restarting one link
+# never touches the other. The norns commands are the *-norns ones.
+#
+# The other way, this Mac's audio can feed the norns input, for scripts to
+# process (start-norns-in):
+#
+#   capture  (this Mac)      contrib/systap: system audio minus the norns
+#                            receiver and SoundSource's arkaudiod, -> RTP
+#   receiver (norns)         system unit "pcmlink-recv", playing into JACK
+#                            crone:input_1/2 (the norns input)
+#
+# Leaving those two processes out of the capture is what prevents a feedback
+# loop: the norns' own sound comes back to this Mac through its receiver, and
+# SoundSource replays what it processes (including that) through arkaudiod.
+# The feed also mutes the norns' input monitoring (you hear the source here
+# already), through the norns-remote mod's /norns-remote/setid command.
+#
 # The Linux host and the Windows VM share one display, so at most one of them
 # has a desktop session and only that one should send. The Linux host is asked
 # first: if its graphical session is up, it is the sender and the VM is not
@@ -28,6 +51,14 @@ WIN="${PCMLINK_CTL_WIN_HOST:-win11}"
 LINUX="${PCMLINK_CTL_LINUX_HOST:-pc}"
 LOG="${PCMLINK_CTL_LOG:-$HOME/Library/Logs/pcmlink/receive.log}"
 PY="${PCMLINK_CTL_PYTHON:-python3}"
+NORNS="${PCMLINK_CTL_NORNS_HOST:-norns}"
+NORNS_PORT="${PCMLINK_CTL_NORNS_PORT:-5006}"
+NORNS_LOG="${PCMLINK_CTL_NORNS_LOG:-$HOME/Library/Logs/pcmlink/receive-norns.log}"
+SYSTAP="${PCMLINK_CTL_SYSTAP:-$DIR/contrib/systap/systap}"
+NI_PORT="${PCMLINK_CTL_NORNS_IN_PORT:-5008}"
+NI_GAIN="${PCMLINK_CTL_NORNS_IN_GAIN:-0.5}"
+NI_LOG="${PCMLINK_CTL_NORNS_IN_LOG:-$HOME/Library/Logs/pcmlink/feed-norns.log}"
+NI_UNIT=pcmlink-recv.service
 TASK=pcmlink-send
 UNIT=pcmlink-send.service
 
@@ -39,7 +70,12 @@ c_ok=$(printf '\033[32m'); c_bad=$(printf '\033[31m'); c_dim=$(printf '\033[2m')
 # merely contains that text (a script checking on the receiver, say). start-rx
 # then takes that shell for a running receiver and starts nothing, and pkill
 # kills the shell.
-RX_MATCH='^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive'
+#
+# The first argument tells the two receivers apart: the PC one is started as
+# "receive --device ...", the norns one as "receive --port <NORNS_PORT> ...".
+# Keep that order in rx_start and nx_start, or each will see the other.
+RX_MATCH='^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --device'
+NX_MATCH="^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --port $NORNS_PORT"
 
 rx_pid() { pgrep -f "$RX_MATCH" 2>/dev/null | head -1; }
 rx_count() { pgrep -f "$RX_MATCH" 2>/dev/null | wc -l | tr -d ' '; }
@@ -63,6 +99,147 @@ rx_stop() {
     pkill -f "$RX_MATCH" 2>/dev/null || true
     sleep 1
     echo "receiver stopped (was pid $pid)"
+}
+
+# ---- norns link: same receiver program, its own port and log
+
+nx_pid() { pgrep -f "$NX_MATCH" 2>/dev/null | head -1; }
+
+nx_start() {
+    if [ -n "$(nx_pid)" ]; then echo "norns receiver already running (pid $(nx_pid))"; return 0; fi
+    mkdir -p "$(dirname "$NORNS_LOG")"
+    ( cd "$DIR" && nohup "$PY" pcmlink.py receive --port "$NORNS_PORT" --device "$DEVICE" \
+        --volume "$VOLUME" </dev/null >>"$NORNS_LOG" 2>&1 & ) >/dev/null 2>&1
+    sleep 2
+    if [ -n "$(nx_pid)" ]; then echo "norns receiver started (pid $(nx_pid))"
+    else echo "${c_bad}norns receiver failed to start${c_off}; see $NORNS_LOG"; return 1; fi
+}
+
+nx_stop() {
+    pid=$(nx_pid) || true
+    if [ -z "${pid:-}" ]; then echo "norns receiver not running"; return 0; fi
+    pkill -f "$NX_MATCH" 2>/dev/null || true
+    sleep 1
+    echo "norns receiver stopped (was pid $pid)"
+}
+
+# The norns sender is a system unit (norns has no desktop session for a user
+# unit to follow), so it needs sudo, which the norns user has without a password.
+norns_q() {
+    ssh -o ConnectTimeout=5 -o BatchMode=yes "$NORNS" "systemctl is-active $UNIT" \
+        2>/dev/null | tail -1
+}
+
+norns_tx() {
+    ssh -o ConnectTimeout=5 -o BatchMode=yes "$NORNS" "sudo systemctl $1 $UNIT" >/dev/null 2>&1 || {
+        echo "${c_bad}could not $1 the norns sender${c_off}"; return 1; }
+    echo "norns sender: $(norns_q)"
+}
+
+# ---- norns input: this Mac's audio into the norns
+
+# The feed loop is this script running "_feed-norns" under /bin/sh.
+NI_MATCH='^/bin/sh [^ ]*pcmlink-ctl _feed-norns'
+ni_pid() { pgrep -f "$NI_MATCH" 2>/dev/null | head -1; }
+
+norns_ip() { ssh -G "$NORNS" 2>/dev/null | awk '$1 == "hostname" { print $2 }'; }
+
+# Set a norns parameter by id; needs the norns-remote mod on the norns.
+norns_setid() {
+    "$PY" - "$(norns_ip)" "$1" "$2" <<'EOF'
+import socket, struct, sys
+host, name, value = sys.argv[1], sys.argv[2], float(sys.argv[3])
+pad = lambda b: b + b"\0" * (4 - len(b) % 4)
+msg = pad(b"/norns-remote/setid") + pad(b",sf") + pad(name.encode()) + struct.pack(">f", value)
+socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(msg, (host, 10111))
+EOF
+}
+
+# The processes the capture must leave out (see the top of this file).
+ni_excluded() { printf '%s/%s' "$(nx_pid || true)" "$(pgrep -x arkaudiod | head -1 || true)"; }
+
+# Runs in the background. A restarted receiver or arkaudiod has a new pid that
+# the running capture does not exclude, so the capture restarts whenever they
+# change (checked every 2 seconds).
+ni_feed() {
+    host=$(norns_ip)
+    rate=$("$SYSTAP" --format | cut -d' ' -f1)
+    while :; do
+        excluded=$(ni_excluded)
+        set --
+        for pid in $(echo "$excluded" | tr / ' '); do set -- "$@" --exclude-pid "$pid"; done
+        echo "$(date '+%H:%M:%S') capturing at $rate Hz, excluding pids $excluded"
+        "$SYSTAP" "$@" | gst-launch-1.0 -q fdsrc fd=0 \
+            ! rawaudioparse use-sink-caps=false format=pcm pcm-format=f32le \
+                sample-rate="$rate" num-channels=2 \
+            ! audioconvert ! audioresample ! volume volume="$NI_GAIN" ! audioconvert \
+            ! "audio/x-raw,format=S16BE,rate=48000,channels=2" \
+            ! rtpL16pay pt=96 mtu=1200 \
+            ! udpsink host="$host" port="$NI_PORT" sync=false async=false &
+        gst=$!
+        while kill -0 "$gst" 2>/dev/null; do
+            sleep 2
+            if [ "$(ni_excluded)" != "$excluded" ]; then
+                echo "$(date '+%H:%M:%S') an excluded process changed; restarting the capture"
+                break
+            fi
+        done
+        # systap exits on its next write once gst-launch is gone.
+        kill "$gst" 2>/dev/null || true
+        wait "$gst" 2>/dev/null || true
+        sleep 1
+    done
+}
+
+ni_start() {
+    if [ -n "$(ni_pid)" ]; then echo "norns input feed already running (pid $(ni_pid))"; return 0; fi
+    [ -x "$SYSTAP" ] || { echo "${c_bad}systap not built${c_off}: swiftc -O $DIR/contrib/systap/systap.swift -o $SYSTAP"; return 1; }
+    ssh -o ConnectTimeout=5 -o BatchMode=yes "$NORNS" "sudo systemctl start $NI_UNIT" >/dev/null 2>&1 || {
+        echo "${c_bad}could not start the receiver on $NORNS${c_off}"; return 1; }
+    norns_setid monitor_level -inf
+    mkdir -p "$(dirname "$NI_LOG")"
+    ( nohup /bin/sh "$0" _feed-norns </dev/null >>"$NI_LOG" 2>&1 & ) >/dev/null 2>&1
+    sleep 2
+    if [ -n "$(ni_pid)" ]; then echo "norns input feed started (pid $(ni_pid)); input monitoring muted"
+    else echo "${c_bad}norns input feed failed to start${c_off}; see $NI_LOG"; return 1; fi
+}
+
+ni_stop() {
+    pid=$(ni_pid) || true
+    if [ -n "${pid:-}" ]; then
+        # Children first: once the loop is gone they are no longer findable by parent.
+        kids=$(pgrep -P "$pid" | tr '\n' ' ')
+        kill "$pid" 2>/dev/null || true
+        # shellcheck disable=SC2086 # one word per pid
+        [ -n "$kids" ] && kill $kids 2>/dev/null || true
+        pkill -x systap 2>/dev/null || true
+        echo "norns input feed stopped (was pid $pid)"
+    else
+        echo "norns input feed not running"
+    fi
+    ssh -o ConnectTimeout=5 -o BatchMode=yes "$NORNS" "sudo systemctl stop $NI_UNIT" >/dev/null 2>&1 || true
+    norns_setid monitor_level 0
+    echo "input monitoring back to 0 dB"
+}
+
+norns_status() {
+    printf 'receiver  '
+    pid=$(nx_pid) || true
+    if [ -n "${pid:-}" ]; then printf '%srunning%s  pid %s, port %s\n' "$c_ok" "$c_off" "$pid" "$NORNS_PORT"
+    else printf '%sstopped%s\n' "$c_bad" "$c_off"; fi
+    printf 'sender    '
+    case "$(norns_q)" in
+        active) printf '%srunning%s  %s\n' "$c_ok" "$c_off" "$NORNS" ;;
+        "")     printf '%sunreachable%s (%s)\n' "$c_bad" "$c_off" "$NORNS" ;;
+        *)      printf '%sstopped%s  %s\n' "$c_bad" "$c_off" "$NORNS" ;;
+    esac
+    printf 'audio     '
+    if [ -n "${pid:-}" ] && flow "$NORNS_LOG"; then printf '%sflowing%s\n' "$c_ok" "$c_off"
+    else printf '%sno packets%s\n' "$c_bad" "$c_off"; fi
+    printf '%s%s%s\n' "$c_dim" "$(tail -1 "$NORNS_LOG" 2>/dev/null)" "$c_off"
+    printf 'input     '
+    if [ -n "$(ni_pid)" ]; then printf '%sfeeding%s  this Mac -> norns input (port %s, gain %s)\n' "$c_ok" "$c_off" "$NI_PORT" "$NI_GAIN"
+    else printf '%soff%s\n' "$c_dim" "$c_off"; fi
 }
 
 # systemctl --user on the Linux host. Prints the unit state (active, inactive,
@@ -126,9 +303,10 @@ tx_stop() {
 
 flow() {
     # Two samples a second apart: if the packet counter moves, audio is flowing.
-    a=$(tail -1 "$LOG" 2>/dev/null)
+    log="${1:-$LOG}"
+    a=$(tail -1 "$log" 2>/dev/null)
     sleep 2
-    b=$(tail -1 "$LOG" 2>/dev/null)
+    b=$(tail -1 "$log" 2>/dev/null)
     [ -n "$a" ] && [ "$a" != "$b" ] || return 1
     # The line advances every second while running; require a non-zero rate too,
     # so "receiver alive but sender silent" is not reported as flowing.
@@ -223,6 +401,15 @@ case "${1:-status}" in
     stop-rx)  rx_stop ;;
     logs)     tail -f "$LOG" ;;
     sender-logs) sender_logs ;;
+    norns)         norns_status ;;
+    start-norns)   nx_start; norns_tx start ;;
+    start-norns-rx) nx_start ;;
+    stop-norns)    norns_tx stop; nx_stop ;;
+    restart-norns) norns_tx stop; nx_stop; sleep 1; nx_start; norns_tx start; sleep 3; echo; norns_status ;;
+    norns-logs)    tail -f "$NORNS_LOG" ;;
+    start-norns-in) ni_start ;;
+    stop-norns-in)  ni_stop ;;
+    _feed-norns)    ni_feed ;;
     *) cat <<USAGE
 usage: pcmlink-ctl [command]
 
@@ -236,6 +423,17 @@ usage: pcmlink-ctl [command]
   logs          follow the receiver log
   sender-logs   follow the active sender's log over ssh
 
+  norns           status of the norns link (port $NORNS_PORT)
+  start-norns     norns receiver here, then the sender on the norns
+  start-norns-rx  norns receiver only, and only if not running; safe at login
+  stop-norns      both ends of the norns link
+  restart-norns   both ends of the norns link, then show status
+  norns-logs      follow the norns receiver log
+  start-norns-in  feed this Mac's audio into the norns input (minus the norns
+                  itself and SoundSource's replay, so it cannot loop); mutes
+                  the norns' input monitoring
+  stop-norns-in   stop that feed and restore input monitoring
+
 environment:
   PCMLINK_CTL_DEVICE      output device substring             (default: Babyface)
   PCMLINK_CTL_VOLUME      software gain                       (default: 1.0)
@@ -243,6 +441,13 @@ environment:
   PCMLINK_CTL_WIN_HOST    ssh host alias of the Windows VM    (default: win11)
   PCMLINK_CTL_LOG         receiver log path
   PCMLINK_CTL_PYTHON      interpreter to run the receiver     (default: python3)
+  PCMLINK_CTL_NORNS_HOST  ssh host alias of the norns         (default: norns)
+  PCMLINK_CTL_NORNS_PORT  UDP port of the norns link          (default: 5006)
+  PCMLINK_CTL_NORNS_LOG   norns receiver log path
+  PCMLINK_CTL_NORNS_IN_GAIN  gain of the feed into the norns   (default: 0.5)
+  PCMLINK_CTL_NORNS_IN_PORT  its UDP port                      (default: 5008)
+  PCMLINK_CTL_NORNS_IN_LOG   its log path
+  PCMLINK_CTL_SYSTAP      the systap binary  (default: \$PCMLINK_DIR/contrib/systap/systap)
   PCMLINK_DIR             checkout containing pcmlink.py
 USAGE
        exit 1 ;;
